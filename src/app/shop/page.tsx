@@ -11,6 +11,15 @@ export const revalidate = 3600;
 const Shop: FC = () => {
   return (
     <>
+      <aside
+        aria-label='Shop alpha notice'
+        className='mx-2 mt-4 rounded-xl border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-center text-sm leading-6 text-amber-50 md:mx-5 lg:mx-6'
+      >
+        <span className='font-semibold text-amber-200'>Shop alpha:</span>{' '}
+        Some storefront features are still being completed and may not work fully. Orders placed
+        through checkout are real and made to order.
+      </aside>
+
       <Deals />
 
       <div className='relative px-2 py-12 md:px-[20px] lg:px-[24px] space-y-12'>

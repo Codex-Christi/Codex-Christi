@@ -15,7 +15,7 @@ const WaitlistButton = () => {
     if (isAuthenticated) {
       router.push('/profile');
     } else {
-      router.push('/auth/signup?waitlist=true');
+      router.push('/auth/signup');
     }
   };
 
