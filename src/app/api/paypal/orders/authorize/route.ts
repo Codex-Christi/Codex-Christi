@@ -10,6 +10,16 @@ import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
 import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
 import { createPayPalRouteResponders } from '@/lib/paypal/txLedger/routeResponses';
 import { refreshPaidOrderRecoveryProjectionSafely } from '@/lib/paypal/txLedger/paidOrderRecoveryProjection';
+import type { CanonicalPaymentReconciliationResult } from '@/lib/paypal/txLedger/canonicalPaymentReconciliation';
+import { notifyCanonicalPaymentFailure } from '@/lib/paypal/txLedger/canonicalPaymentFailureNotification';
+import { shouldResyncExistingAuthorization } from '@/lib/paypal/txLedger/authorizationRecoveryPolicy';
+import { hasProcessingAuthorizePayload } from '@/lib/paypal/txLedger/paymentReconciliationEvidence';
+import { commitOptimisticLedgerTransition } from '@/lib/paypal/txLedger/optimisticLedgerTransition';
+import {
+  buildPayPalAuthorizationFailureLedgerTransition,
+  buildPayPalAuthorizationLedgerTransition,
+} from '@/lib/paypal/txLedger/payPalAuthorizationLedgerTransition';
+import type { Prisma } from '@/lib/prisma/shop/paypal/txLedger/generated/paypalTxLedger/client';
 
 const NON_AUTHORIZABLE_STATUSES = new Set<string>([
   PAYPAL_LEDGER_STATUS.CAPTURED,
@@ -33,17 +43,50 @@ async function persistAuthorizedResult(
   orderToken: string,
   payload: OrderAuthorizeResponse | Order,
 ) {
-  const paypalAuthorizationId = getAuthorizationId(payload);
-
-  await paypalTxLedger.paypalIntent.update({
-    where: { orderToken },
-    data: {
-      status: PAYPAL_LEDGER_STATUS.AUTHORIZED,
-      paypalAuthorizationId,
-      authorizePayload: JSON.parse(JSON.stringify(payload)),
+  const committed = await commitOptimisticLedgerTransition({
+    load: () => paypalTxLedger.paypalIntent.findUnique({ where: { orderToken } }),
+    build: (row) => buildPayPalAuthorizationLedgerTransition(row, payload),
+    commit: async (row, transition) => {
+      const updated = await paypalTxLedger.paypalIntent.updateMany({
+        where: { orderToken, status: row.status, updatedAt: row.updatedAt },
+        data: transition.data as Prisma.PaypalIntentUpdateManyMutationInput,
+      });
+      return updated.count === 1;
     },
   });
   await refreshPaidOrderRecoveryProjectionSafely(orderToken);
+  if (committed.transition.reconciliationFailure) {
+    await notifyCanonicalPaymentFailure(
+      committed.row,
+      committed.transition.reconciliationFailure,
+    );
+  }
+
+  return committed.transition.reconciliation;
+}
+
+async function persistAuthorizationFailure(
+  orderToken: string,
+  failure: { code: string; message: string },
+) {
+  const committed = await commitOptimisticLedgerTransition({
+    load: () => paypalTxLedger.paypalIntent.findUnique({ where: { orderToken } }),
+    build: (row) => buildPayPalAuthorizationFailureLedgerTransition(row, failure),
+    commit: async (row, transition) => {
+      const updated = await paypalTxLedger.paypalIntent.updateMany({
+        where: { orderToken, status: row.status, updatedAt: row.updatedAt },
+        data: transition.data as Prisma.PaypalIntentUpdateManyMutationInput,
+      });
+      return updated.count === 1;
+    },
+  });
+  await refreshPaidOrderRecoveryProjectionSafely(orderToken);
+  if (committed.transition.reconciliationFailure) {
+    await notifyCanonicalPaymentFailure(
+      committed.row,
+      committed.transition.reconciliationFailure,
+    );
+  }
 }
 
 async function syncExistingAuthorization(orderID: string, orderToken: string) {
@@ -52,8 +95,8 @@ async function syncExistingAuthorization(orderID: string, orderToken: string) {
 
   if (!getAuthorizationId(result)) return null;
 
-  await persistAuthorizedResult(orderToken, result);
-  return result;
+  const reconciliation = await persistAuthorizedResult(orderToken, result);
+  return { payload: result, reconciliation };
 }
 
 export async function POST(req: Request) {
@@ -70,6 +113,13 @@ export async function POST(req: Request) {
       code,
       stage: 'validate_request',
       message,
+    });
+  const reconciliationError = (result: CanonicalPaymentReconciliationResult) =>
+    routeError({
+      status: 409,
+      code: result.errorCode ?? 'PAYPAL_AUTHORIZATION_AMOUNT_MISMATCH',
+      stage: 'reconcile_authorization_amount',
+      message: result.reason,
     });
   const fail = async ({
     code,
@@ -95,15 +145,10 @@ export async function POST(req: Request) {
     });
 
     if (persistToLedger && orderToken) {
-      await paypalTxLedger.paypalIntent.update({
-        where: { orderToken },
-        data: {
-          status: PAYPAL_LEDGER_STATUS.ERROR,
-          lastErrorCode: code,
-          lastErrorMessage: err instanceof Error ? err.message : String(err),
-        },
+      await persistAuthorizationFailure(orderToken, {
+        code,
+        message: err instanceof Error ? err.message : String(err),
       });
-      await refreshPaidOrderRecoveryProjectionSafely(orderToken);
     }
 
     return routeError({
@@ -144,16 +189,38 @@ export async function POST(req: Request) {
       });
     }
 
-    if (intent.status === PAYPAL_LEDGER_STATUS.AUTHORIZED && intent.authorizePayload) {
+    if (
+      intent.status === PAYPAL_LEDGER_STATUS.AUTHORIZED &&
+      hasProcessingAuthorizePayload(intent.authorizePayload)
+    ) {
+      const reconciliation = await persistAuthorizedResult(
+        orderToken,
+        intent.authorizePayload as unknown as Order,
+      );
+      if (!reconciliation.ok) return reconciliationError(reconciliation);
+
       return Response.json(intent.authorizePayload);
     }
 
-    // If PayPal already authorized earlier but our ledger write failed, resync instead of reauthorizing.
-    if (intent.status === PAYPAL_LEDGER_STATUS.ERROR) {
+    // PayPal may already be authorized because our write failed or because its verified webhook
+    // won the race. Fetch the order-shaped provider payload instead of reauthorizing or rejecting
+    // an AUTHORIZED row whose detailed evidence has not landed yet.
+    if (shouldResyncExistingAuthorization(intent)) {
       try {
         const existingAuthorizedOrder = await syncExistingAuthorization(orderID, orderToken);
         if (existingAuthorizedOrder) {
-          return Response.json(existingAuthorizedOrder);
+          if (!existingAuthorizedOrder.reconciliation.ok) {
+            return reconciliationError(existingAuthorizedOrder.reconciliation);
+          }
+          return Response.json(existingAuthorizedOrder.payload);
+        }
+        if (intent.status === PAYPAL_LEDGER_STATUS.AUTHORIZED) {
+          return routeError({
+            status: 409,
+            code: 'AUTHORIZATION_EVIDENCE_PENDING',
+            stage: 'resync_authorize_state',
+            message: 'PayPal authorization is confirmed, but its order details are still syncing.',
+          });
         }
       } catch (syncErr) {
         return fail({
@@ -194,7 +261,8 @@ export async function POST(req: Request) {
     });
 
     try {
-      await persistAuthorizedResult(orderToken, result);
+      const reconciliation = await persistAuthorizedResult(orderToken, result);
+      if (!reconciliation.ok) return reconciliationError(reconciliation);
     } catch (persistErr) {
       // Keep this distinct so retries know PayPal may already be ahead of the ledger.
       return fail({

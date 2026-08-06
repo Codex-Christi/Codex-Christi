@@ -47,6 +47,8 @@ export type PaypalIntentMinAggregateOutputType = {
   countryIso2: string | null
   countryIso3: string | null
   initialCurrency: string | null
+  canonicalOrderSnapshotVersion: string | null
+  canonicalOrderSnapshotHash: string | null
   merchizeFulfillmentProcessingId: string | null
   merchizeProviderOrderId: string | null
   merchizeProviderOrderCode: string | null
@@ -88,6 +90,8 @@ export type PaypalIntentMaxAggregateOutputType = {
   countryIso2: string | null
   countryIso3: string | null
   initialCurrency: string | null
+  canonicalOrderSnapshotVersion: string | null
+  canonicalOrderSnapshotHash: string | null
   merchizeFulfillmentProcessingId: string | null
   merchizeProviderOrderId: string | null
   merchizeProviderOrderCode: string | null
@@ -131,6 +135,9 @@ export type PaypalIntentCountAggregateOutputType = {
   initialCurrency: number
   cartSnapshot: number
   shippingSnapshot: number
+  canonicalOrderSnapshot: number
+  canonicalOrderSnapshotVersion: number
+  canonicalOrderSnapshotHash: number
   authorizePayload: number
   capturePayload: number
   djangoOrderIntentPayload: number
@@ -190,6 +197,8 @@ export type PaypalIntentMinAggregateInputType = {
   countryIso2?: true
   countryIso3?: true
   initialCurrency?: true
+  canonicalOrderSnapshotVersion?: true
+  canonicalOrderSnapshotHash?: true
   merchizeFulfillmentProcessingId?: true
   merchizeProviderOrderId?: true
   merchizeProviderOrderCode?: true
@@ -231,6 +240,8 @@ export type PaypalIntentMaxAggregateInputType = {
   countryIso2?: true
   countryIso3?: true
   initialCurrency?: true
+  canonicalOrderSnapshotVersion?: true
+  canonicalOrderSnapshotHash?: true
   merchizeFulfillmentProcessingId?: true
   merchizeProviderOrderId?: true
   merchizeProviderOrderCode?: true
@@ -274,6 +285,9 @@ export type PaypalIntentCountAggregateInputType = {
   initialCurrency?: true
   cartSnapshot?: true
   shippingSnapshot?: true
+  canonicalOrderSnapshot?: true
+  canonicalOrderSnapshotVersion?: true
+  canonicalOrderSnapshotHash?: true
   authorizePayload?: true
   capturePayload?: true
   djangoOrderIntentPayload?: true
@@ -412,6 +426,9 @@ export type PaypalIntentGroupByOutputType = {
   initialCurrency: string | null
   cartSnapshot: runtime.JsonValue
   shippingSnapshot: runtime.JsonValue
+  canonicalOrderSnapshot: runtime.JsonValue | null
+  canonicalOrderSnapshotVersion: string | null
+  canonicalOrderSnapshotHash: string | null
   authorizePayload: runtime.JsonValue | null
   capturePayload: runtime.JsonValue | null
   djangoOrderIntentPayload: runtime.JsonValue | null
@@ -486,6 +503,9 @@ export type PaypalIntentWhereInput = {
   initialCurrency?: Prisma.StringNullableFilter<"PaypalIntent"> | string | null
   cartSnapshot?: Prisma.JsonFilter<"PaypalIntent">
   shippingSnapshot?: Prisma.JsonFilter<"PaypalIntent">
+  canonicalOrderSnapshot?: Prisma.JsonNullableFilter<"PaypalIntent">
+  canonicalOrderSnapshotVersion?: Prisma.StringNullableFilter<"PaypalIntent"> | string | null
+  canonicalOrderSnapshotHash?: Prisma.StringNullableFilter<"PaypalIntent"> | string | null
   authorizePayload?: Prisma.JsonNullableFilter<"PaypalIntent">
   capturePayload?: Prisma.JsonNullableFilter<"PaypalIntent">
   djangoOrderIntentPayload?: Prisma.JsonNullableFilter<"PaypalIntent">
@@ -537,6 +557,9 @@ export type PaypalIntentOrderByWithRelationInput = {
   initialCurrency?: Prisma.SortOrderInput | Prisma.SortOrder
   cartSnapshot?: Prisma.SortOrder
   shippingSnapshot?: Prisma.SortOrder
+  canonicalOrderSnapshot?: Prisma.SortOrderInput | Prisma.SortOrder
+  canonicalOrderSnapshotVersion?: Prisma.SortOrderInput | Prisma.SortOrder
+  canonicalOrderSnapshotHash?: Prisma.SortOrderInput | Prisma.SortOrder
   authorizePayload?: Prisma.SortOrderInput | Prisma.SortOrder
   capturePayload?: Prisma.SortOrderInput | Prisma.SortOrder
   djangoOrderIntentPayload?: Prisma.SortOrderInput | Prisma.SortOrder
@@ -591,6 +614,9 @@ export type PaypalIntentWhereUniqueInput = Prisma.AtLeast<{
   initialCurrency?: Prisma.StringNullableFilter<"PaypalIntent"> | string | null
   cartSnapshot?: Prisma.JsonFilter<"PaypalIntent">
   shippingSnapshot?: Prisma.JsonFilter<"PaypalIntent">
+  canonicalOrderSnapshot?: Prisma.JsonNullableFilter<"PaypalIntent">
+  canonicalOrderSnapshotVersion?: Prisma.StringNullableFilter<"PaypalIntent"> | string | null
+  canonicalOrderSnapshotHash?: Prisma.StringNullableFilter<"PaypalIntent"> | string | null
   authorizePayload?: Prisma.JsonNullableFilter<"PaypalIntent">
   capturePayload?: Prisma.JsonNullableFilter<"PaypalIntent">
   djangoOrderIntentPayload?: Prisma.JsonNullableFilter<"PaypalIntent">
@@ -642,6 +668,9 @@ export type PaypalIntentOrderByWithAggregationInput = {
   initialCurrency?: Prisma.SortOrderInput | Prisma.SortOrder
   cartSnapshot?: Prisma.SortOrder
   shippingSnapshot?: Prisma.SortOrder
+  canonicalOrderSnapshot?: Prisma.SortOrderInput | Prisma.SortOrder
+  canonicalOrderSnapshotVersion?: Prisma.SortOrderInput | Prisma.SortOrder
+  canonicalOrderSnapshotHash?: Prisma.SortOrderInput | Prisma.SortOrder
   authorizePayload?: Prisma.SortOrderInput | Prisma.SortOrder
   capturePayload?: Prisma.SortOrderInput | Prisma.SortOrder
   djangoOrderIntentPayload?: Prisma.SortOrderInput | Prisma.SortOrder
@@ -701,6 +730,9 @@ export type PaypalIntentScalarWhereWithAggregatesInput = {
   initialCurrency?: Prisma.StringNullableWithAggregatesFilter<"PaypalIntent"> | string | null
   cartSnapshot?: Prisma.JsonWithAggregatesFilter<"PaypalIntent">
   shippingSnapshot?: Prisma.JsonWithAggregatesFilter<"PaypalIntent">
+  canonicalOrderSnapshot?: Prisma.JsonNullableWithAggregatesFilter<"PaypalIntent">
+  canonicalOrderSnapshotVersion?: Prisma.StringNullableWithAggregatesFilter<"PaypalIntent"> | string | null
+  canonicalOrderSnapshotHash?: Prisma.StringNullableWithAggregatesFilter<"PaypalIntent"> | string | null
   authorizePayload?: Prisma.JsonNullableWithAggregatesFilter<"PaypalIntent">
   capturePayload?: Prisma.JsonNullableWithAggregatesFilter<"PaypalIntent">
   djangoOrderIntentPayload?: Prisma.JsonNullableWithAggregatesFilter<"PaypalIntent">
@@ -752,6 +784,9 @@ export type PaypalIntentCreateInput = {
   initialCurrency?: string | null
   cartSnapshot: Prisma.JsonNullValueInput | runtime.InputJsonValue
   shippingSnapshot: Prisma.JsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshot?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshotVersion?: string | null
+  canonicalOrderSnapshotHash?: string | null
   authorizePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   capturePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   djangoOrderIntentPayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
@@ -803,6 +838,9 @@ export type PaypalIntentUncheckedCreateInput = {
   initialCurrency?: string | null
   cartSnapshot: Prisma.JsonNullValueInput | runtime.InputJsonValue
   shippingSnapshot: Prisma.JsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshot?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshotVersion?: string | null
+  canonicalOrderSnapshotHash?: string | null
   authorizePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   capturePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   djangoOrderIntentPayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
@@ -854,6 +892,9 @@ export type PaypalIntentUpdateInput = {
   initialCurrency?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
   cartSnapshot?: Prisma.JsonNullValueInput | runtime.InputJsonValue
   shippingSnapshot?: Prisma.JsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshot?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshotVersion?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  canonicalOrderSnapshotHash?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
   authorizePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   capturePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   djangoOrderIntentPayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
@@ -905,6 +946,9 @@ export type PaypalIntentUncheckedUpdateInput = {
   initialCurrency?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
   cartSnapshot?: Prisma.JsonNullValueInput | runtime.InputJsonValue
   shippingSnapshot?: Prisma.JsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshot?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshotVersion?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  canonicalOrderSnapshotHash?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
   authorizePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   capturePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   djangoOrderIntentPayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
@@ -956,6 +1000,9 @@ export type PaypalIntentCreateManyInput = {
   initialCurrency?: string | null
   cartSnapshot: Prisma.JsonNullValueInput | runtime.InputJsonValue
   shippingSnapshot: Prisma.JsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshot?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshotVersion?: string | null
+  canonicalOrderSnapshotHash?: string | null
   authorizePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   capturePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   djangoOrderIntentPayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
@@ -1007,6 +1054,9 @@ export type PaypalIntentUpdateManyMutationInput = {
   initialCurrency?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
   cartSnapshot?: Prisma.JsonNullValueInput | runtime.InputJsonValue
   shippingSnapshot?: Prisma.JsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshot?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshotVersion?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  canonicalOrderSnapshotHash?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
   authorizePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   capturePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   djangoOrderIntentPayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
@@ -1058,6 +1108,9 @@ export type PaypalIntentUncheckedUpdateManyInput = {
   initialCurrency?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
   cartSnapshot?: Prisma.JsonNullValueInput | runtime.InputJsonValue
   shippingSnapshot?: Prisma.JsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshot?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
+  canonicalOrderSnapshotVersion?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  canonicalOrderSnapshotHash?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
   authorizePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   capturePayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
   djangoOrderIntentPayload?: Prisma.NullableJsonNullValueInput | runtime.InputJsonValue
@@ -1109,6 +1162,9 @@ export type PaypalIntentCountOrderByAggregateInput = {
   initialCurrency?: Prisma.SortOrder
   cartSnapshot?: Prisma.SortOrder
   shippingSnapshot?: Prisma.SortOrder
+  canonicalOrderSnapshot?: Prisma.SortOrder
+  canonicalOrderSnapshotVersion?: Prisma.SortOrder
+  canonicalOrderSnapshotHash?: Prisma.SortOrder
   authorizePayload?: Prisma.SortOrder
   capturePayload?: Prisma.SortOrder
   djangoOrderIntentPayload?: Prisma.SortOrder
@@ -1162,6 +1218,8 @@ export type PaypalIntentMaxOrderByAggregateInput = {
   countryIso2?: Prisma.SortOrder
   countryIso3?: Prisma.SortOrder
   initialCurrency?: Prisma.SortOrder
+  canonicalOrderSnapshotVersion?: Prisma.SortOrder
+  canonicalOrderSnapshotHash?: Prisma.SortOrder
   merchizeFulfillmentProcessingId?: Prisma.SortOrder
   merchizeProviderOrderId?: Prisma.SortOrder
   merchizeProviderOrderCode?: Prisma.SortOrder
@@ -1203,6 +1261,8 @@ export type PaypalIntentMinOrderByAggregateInput = {
   countryIso2?: Prisma.SortOrder
   countryIso3?: Prisma.SortOrder
   initialCurrency?: Prisma.SortOrder
+  canonicalOrderSnapshotVersion?: Prisma.SortOrder
+  canonicalOrderSnapshotHash?: Prisma.SortOrder
   merchizeFulfillmentProcessingId?: Prisma.SortOrder
   merchizeProviderOrderId?: Prisma.SortOrder
   merchizeProviderOrderCode?: Prisma.SortOrder
@@ -1276,6 +1336,9 @@ export type PaypalIntentSelect<ExtArgs extends runtime.Types.Extensions.Internal
   initialCurrency?: boolean
   cartSnapshot?: boolean
   shippingSnapshot?: boolean
+  canonicalOrderSnapshot?: boolean
+  canonicalOrderSnapshotVersion?: boolean
+  canonicalOrderSnapshotHash?: boolean
   authorizePayload?: boolean
   capturePayload?: boolean
   djangoOrderIntentPayload?: boolean
@@ -1327,6 +1390,9 @@ export type PaypalIntentSelectCreateManyAndReturn<ExtArgs extends runtime.Types.
   initialCurrency?: boolean
   cartSnapshot?: boolean
   shippingSnapshot?: boolean
+  canonicalOrderSnapshot?: boolean
+  canonicalOrderSnapshotVersion?: boolean
+  canonicalOrderSnapshotHash?: boolean
   authorizePayload?: boolean
   capturePayload?: boolean
   djangoOrderIntentPayload?: boolean
@@ -1378,6 +1444,9 @@ export type PaypalIntentSelectUpdateManyAndReturn<ExtArgs extends runtime.Types.
   initialCurrency?: boolean
   cartSnapshot?: boolean
   shippingSnapshot?: boolean
+  canonicalOrderSnapshot?: boolean
+  canonicalOrderSnapshotVersion?: boolean
+  canonicalOrderSnapshotHash?: boolean
   authorizePayload?: boolean
   capturePayload?: boolean
   djangoOrderIntentPayload?: boolean
@@ -1429,6 +1498,9 @@ export type PaypalIntentSelectScalar = {
   initialCurrency?: boolean
   cartSnapshot?: boolean
   shippingSnapshot?: boolean
+  canonicalOrderSnapshot?: boolean
+  canonicalOrderSnapshotVersion?: boolean
+  canonicalOrderSnapshotHash?: boolean
   authorizePayload?: boolean
   capturePayload?: boolean
   djangoOrderIntentPayload?: boolean
@@ -1465,7 +1537,7 @@ export type PaypalIntentSelectScalar = {
   updatedAt?: boolean
 }
 
-export type PaypalIntentOmit<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = runtime.Types.Extensions.GetOmit<"id" | "orderToken" | "paypalOrderId" | "paypalAuthorizationId" | "djangoOrderIntentUuid" | "djangoOrderIntentOrderId" | "customerName" | "customerEmail" | "userId" | "countryIso2" | "countryIso3" | "initialCurrency" | "cartSnapshot" | "shippingSnapshot" | "authorizePayload" | "capturePayload" | "djangoOrderIntentPayload" | "djangoOrderIntentVerifyPayload" | "djangoPaymentSaveResponsePayload" | "merchizeFulfillmentRequestPayload" | "merchizeFulfillmentResponsePayload" | "merchizeFulfillmentProcessingId" | "merchizeProviderOrderId" | "merchizeProviderOrderCode" | "fulfillmentAddressOverride" | "fulfillmentAddressOverrideReason" | "fulfillmentAddressOverriddenBy" | "fulfillmentAddressOverriddenAt" | "djangoPaymentSaveCustomId" | "receiptLink" | "receiptFile" | "status" | "lastEventType" | "lastErrorCode" | "lastErrorMessage" | "retryCount" | "processingTriggerSource" | "processingTriggerDetail" | "processingTriggeredAt" | "checkoutSurfaceHost" | "checkoutSurfaceOrigin" | "checkoutSurfaceLabel" | "postProcessingLockId" | "postProcessingLockedAt" | "postProcessingLockExpiresAt" | "processingCompletedAt" | "createdAt" | "updatedAt", ExtArgs["result"]["paypalIntent"]>
+export type PaypalIntentOmit<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = runtime.Types.Extensions.GetOmit<"id" | "orderToken" | "paypalOrderId" | "paypalAuthorizationId" | "djangoOrderIntentUuid" | "djangoOrderIntentOrderId" | "customerName" | "customerEmail" | "userId" | "countryIso2" | "countryIso3" | "initialCurrency" | "cartSnapshot" | "shippingSnapshot" | "canonicalOrderSnapshot" | "canonicalOrderSnapshotVersion" | "canonicalOrderSnapshotHash" | "authorizePayload" | "capturePayload" | "djangoOrderIntentPayload" | "djangoOrderIntentVerifyPayload" | "djangoPaymentSaveResponsePayload" | "merchizeFulfillmentRequestPayload" | "merchizeFulfillmentResponsePayload" | "merchizeFulfillmentProcessingId" | "merchizeProviderOrderId" | "merchizeProviderOrderCode" | "fulfillmentAddressOverride" | "fulfillmentAddressOverrideReason" | "fulfillmentAddressOverriddenBy" | "fulfillmentAddressOverriddenAt" | "djangoPaymentSaveCustomId" | "receiptLink" | "receiptFile" | "status" | "lastEventType" | "lastErrorCode" | "lastErrorMessage" | "retryCount" | "processingTriggerSource" | "processingTriggerDetail" | "processingTriggeredAt" | "checkoutSurfaceHost" | "checkoutSurfaceOrigin" | "checkoutSurfaceLabel" | "postProcessingLockId" | "postProcessingLockedAt" | "postProcessingLockExpiresAt" | "processingCompletedAt" | "createdAt" | "updatedAt", ExtArgs["result"]["paypalIntent"]>
 
 export type $PaypalIntentPayload<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
   name: "PaypalIntent"
@@ -1485,6 +1557,9 @@ export type $PaypalIntentPayload<ExtArgs extends runtime.Types.Extensions.Intern
     initialCurrency: string | null
     cartSnapshot: runtime.JsonValue
     shippingSnapshot: runtime.JsonValue
+    canonicalOrderSnapshot: runtime.JsonValue | null
+    canonicalOrderSnapshotVersion: string | null
+    canonicalOrderSnapshotHash: string | null
     authorizePayload: runtime.JsonValue | null
     capturePayload: runtime.JsonValue | null
     djangoOrderIntentPayload: runtime.JsonValue | null
@@ -1956,6 +2031,9 @@ export interface PaypalIntentFieldRefs {
   readonly initialCurrency: Prisma.FieldRef<"PaypalIntent", 'String'>
   readonly cartSnapshot: Prisma.FieldRef<"PaypalIntent", 'Json'>
   readonly shippingSnapshot: Prisma.FieldRef<"PaypalIntent", 'Json'>
+  readonly canonicalOrderSnapshot: Prisma.FieldRef<"PaypalIntent", 'Json'>
+  readonly canonicalOrderSnapshotVersion: Prisma.FieldRef<"PaypalIntent", 'String'>
+  readonly canonicalOrderSnapshotHash: Prisma.FieldRef<"PaypalIntent", 'String'>
   readonly authorizePayload: Prisma.FieldRef<"PaypalIntent", 'Json'>
   readonly capturePayload: Prisma.FieldRef<"PaypalIntent", 'Json'>
   readonly djangoOrderIntentPayload: Prisma.FieldRef<"PaypalIntent", 'Json'>

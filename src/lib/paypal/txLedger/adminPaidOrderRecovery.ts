@@ -5,6 +5,7 @@ import { formatDistanceToNowStrict } from 'date-fns';
 import { formatAdminSystemTimestamp } from '@/lib/admin/formatAdminSystemTimestamp';
 import { getRecoveryScannerMinAgeMinutes } from '@/lib/paypal/txLedger/processingPolicy';
 import { getPayPalCaptureCompletion } from '@/lib/paypal/txLedger/captureCompletion';
+import { reconcileCanonicalPayPalPaymentChain } from '@/lib/paypal/txLedger/canonicalPaymentReconciliation';
 import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
 import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
 import { listCustomerNotificationsForOrder } from '@/lib/paypal/txLedger/customerNotificationOutbox';
@@ -27,6 +28,11 @@ import { isAcceptedDjangoFulfillmentProcessResponse } from '@/lib/paypal/txLedge
 import { getMerchizeFulfillmentRetryEligibility } from '@/lib/paypal/txLedger/fulfillmentRetryPolicy';
 import { resolvePaidOrderRecoveryIssue } from '@/lib/paypal/txLedger/recoveryIssuePrecedence';
 import { extractMerchizeExternalOrderNumberFromDjangoProcessResponse } from '@/lib/merchizeFulfillmentOps/merchizeMapper';
+import {
+  parseCanonicalOrderSnapshotFromLedger,
+  type CanonicalOrderSnapshotLedgerEnvelope,
+} from '@/lib/paypal/orderSnapshot/canonicalize';
+import type { CanonicalOrderSnapshot } from '@/lib/paypal/orderSnapshot/types';
 import type { Prisma } from '@/lib/prisma/shop/paypal/txLedger/generated/paypalTxLedger/client';
 import type {
   MerchizeFulfillmentOpsAdminSummary,
@@ -144,6 +150,15 @@ function getCaptureAmount(capturePayload: unknown, fallbackCurrency?: string | n
   }
 
   return '—';
+}
+
+function getRecoveryAmount(
+  row: {
+    capturePayload: unknown;
+    initialCurrency: string | null;
+  },
+) {
+  return getCaptureAmount(row.capturePayload, row.initialCurrency);
 }
 
 function mapLedgerStatusToAdminStatus(status: string): PaidOrderRecoveryRow['status'] {
@@ -297,29 +312,31 @@ function formatUpdated(date: Date) {
   return `${formatDistanceToNowStrict(date, { addSuffix: true })}`;
 }
 
-function mapLedgerRowToPaidOrderRecoveryRow(row: {
-  orderToken: string;
-  customerEmail: string;
-  customerName: string;
-  status: string;
-  capturePayload: unknown;
-  initialCurrency: string | null;
-  merchizeFulfillmentResponsePayload: unknown;
-  merchizeFulfillmentOpsSyncStatus?: string | null;
-  merchizeFulfillmentOpsLastSyncErrorCode?: string | null;
-  merchizeFulfillmentOpsPrimaryBlocker?: {
-    code: string;
-    message: string;
-  } | null;
-  latestWebhookSourceLabel?: string | null;
-  lastErrorCode: string | null;
-  lastErrorMessage: string | null;
-  processingTriggerDetail?: string | null;
-  processingTriggeredAt?: Date | null;
-  processingTriggerSource?: string | null;
-  checkoutSurfaceLabel?: string | null;
-  updatedAt: Date;
-}): PaidOrderRecoveryRow {
+function mapLedgerRowToPaidOrderRecoveryRow(
+  row: CanonicalOrderSnapshotLedgerEnvelope & {
+    orderToken: string;
+    customerEmail: string;
+    customerName: string;
+    status: string;
+    capturePayload: unknown;
+    initialCurrency: string | null;
+    merchizeFulfillmentResponsePayload: unknown;
+    merchizeFulfillmentOpsSyncStatus?: string | null;
+    merchizeFulfillmentOpsLastSyncErrorCode?: string | null;
+    merchizeFulfillmentOpsPrimaryBlocker?: {
+      code: string;
+      message: string;
+    } | null;
+    latestWebhookSourceLabel?: string | null;
+    lastErrorCode: string | null;
+    lastErrorMessage: string | null;
+    processingTriggerDetail?: string | null;
+    processingTriggeredAt?: Date | null;
+    processingTriggerSource?: string | null;
+    checkoutSurfaceLabel?: string | null;
+    updatedAt: Date;
+  },
+): PaidOrderRecoveryRow {
   const providerDetailSyncNeeded = needsProviderDetailSync(
     row.merchizeFulfillmentResponsePayload,
     row.merchizeFulfillmentOpsSyncStatus,
@@ -345,7 +362,7 @@ function mapLedgerRowToPaidOrderRecoveryRow(row: {
     orderToken: row.orderToken,
     status: providerDetailSyncNeeded ? 'sync' : mapLedgerStatusToAdminStatus(row.status),
     customer: row.customerEmail || row.customerName,
-    amount: getCaptureAmount(row.capturePayload, row.initialCurrency),
+    amount: getRecoveryAmount(row),
     step: providerDetailSyncNeeded ? 'Provider Detail Sync' : getStepLabel(row.status),
     error: providerDetailSyncNeeded
       ? getProviderDetailSyncMessage({
@@ -724,7 +741,10 @@ function normalizeAddress(value: unknown): PaidOrderRecoveryAddress | null {
   return Object.values(normalized).some(Boolean) ? normalized : null;
 }
 
-function getCartItems(cartSnapshot: unknown, currency: string | null): PaidOrderRecoveryLineItem[] {
+function getLegacyCartItems(
+  cartSnapshot: unknown,
+  currency: string | null,
+): PaidOrderRecoveryLineItem[] {
   if (!Array.isArray(cartSnapshot)) return [];
 
   return cartSnapshot.map((item, index) => {
@@ -752,6 +772,43 @@ function getCartItems(cartSnapshot: unknown, currency: string | null): PaidOrder
         (Array.isArray(itemDetail?.image_uris) ? asString(itemDetail.image_uris[0]) : null),
     };
   });
+}
+
+function getCanonicalOrderItems(snapshot: CanonicalOrderSnapshot): PaidOrderRecoveryLineItem[] {
+  return snapshot.lines.map((line) => {
+    const variant = line.selectedOptions
+      .map((option) => `${option.name}: ${option.value}`)
+      .join(' / ');
+
+    return {
+      id: line.lineId,
+      title: line.title,
+      variant: variant || line.sellerSku || line.sku,
+      quantity: line.quantity,
+      unitPrice: formatCurrency(Number(line.unitAmount.value), snapshot.currency),
+      image: line.imageUrl || null,
+    };
+  });
+}
+
+function getRecoveryOrderItems(
+  row: CanonicalOrderSnapshotLedgerEnvelope & {
+    cartSnapshot: unknown;
+    initialCurrency: string | null;
+  },
+) {
+  let parsedSnapshot;
+  try {
+    parsedSnapshot = parseCanonicalOrderSnapshotFromLedger(row);
+  } catch {
+    // Keep corrupt canonical rows inspectable as payment incidents, but never restore mutable cart
+    // data as order truth. The payment-chain evidence exposes the corruption reason separately.
+    return [];
+  }
+
+  return parsedSnapshot.snapshot
+    ? getCanonicalOrderItems(parsedSnapshot.snapshot)
+    : getLegacyCartItems(row.cartSnapshot, row.initialCurrency);
 }
 
 function formatCurrency(value: number, currency: string | null) {
@@ -929,13 +986,16 @@ function mapWebhookEvent(event: {
   };
 }
 
-function getScannerState(row: {
-  status: string;
-  capturePayload: unknown;
-  processingCompletedAt: Date | null;
-  postProcessingLockExpiresAt: Date | null;
-  updatedAt: Date;
-}) {
+function getScannerState(
+  row: CanonicalOrderSnapshotLedgerEnvelope & {
+    status: string;
+    authorizePayload: unknown;
+    capturePayload: unknown;
+    processingCompletedAt: Date | null;
+    postProcessingLockExpiresAt: Date | null;
+    updatedAt: Date;
+  },
+) {
   if (row.processingCompletedAt) {
     return { eligible: false, reason: 'Processing is already completed.' };
   }
@@ -953,6 +1013,15 @@ function getScannerState(row: {
     return { eligible: false, reason: captureCompletion.reason };
   }
 
+  const paymentChain = reconcileCanonicalPayPalPaymentChain(
+    row,
+    row.authorizePayload,
+    row.capturePayload,
+  );
+  if (!paymentChain.ok) {
+    return { eligible: false, reason: paymentChain.reconciliation.reason };
+  }
+
   if (row.postProcessingLockExpiresAt && row.postProcessingLockExpiresAt > new Date()) {
     return { eligible: false, reason: 'A post-processing lock is active.' };
   }
@@ -966,46 +1035,49 @@ function getScannerState(row: {
   return { eligible: true, reason: 'Eligible for automatic scanner recovery.' };
 }
 
-function buildDetail(row: {
-  orderToken: string;
-  customerName: string;
-  customerEmail: string;
-  userId: string | null;
-  createdAt: Date;
-  updatedAt: Date;
-  receiptLink: string | null;
-  receiptFile: string | null;
-  capturePayload: unknown;
-  shippingSnapshot: unknown;
-  fulfillmentAddressOverride: unknown;
-  fulfillmentAddressOverrideReason: string | null;
-  fulfillmentAddressOverriddenAt: Date | null;
-  fulfillmentAddressOverriddenBy: string | null;
-  cartSnapshot: unknown;
-  initialCurrency: string | null;
-  paypalOrderId: string | null;
-  djangoOrderIntentUuid: string | null;
-  djangoOrderIntentOrderId: string | null;
-  djangoPaymentSaveCustomId: string | null;
-  merchizeFulfillmentResponsePayload: unknown;
-  merchizeFulfillmentProcessingId: string | null;
-  merchizeProviderOrderId: string | null;
-  merchizeProviderOrderCode: string | null;
-  processingCompletedAt: Date | null;
-  processingTriggeredAt: Date | null;
-  processingTriggerDetail: string | null;
-  processingTriggerSource: string | null;
-  checkoutSurfaceHost: string | null;
-  checkoutSurfaceOrigin: string | null;
-  checkoutSurfaceLabel: string | null;
-  postProcessingLockExpiresAt: Date | null;
-  status: string;
-  lastErrorMessage: string | null;
-  lastErrorCode: string | null;
-  lastEventType: string | null;
-  webhookEvents: PaidOrderRecoveryWebhookEvent[];
-  merchizeFulfillmentOps: MerchizeFulfillmentOpsAdminSummary | null;
-}): PaidOrderRecoveryDetail {
+function buildDetail(
+  row: CanonicalOrderSnapshotLedgerEnvelope & {
+    orderToken: string;
+    customerName: string;
+    customerEmail: string;
+    userId: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+    receiptLink: string | null;
+    receiptFile: string | null;
+    authorizePayload: unknown;
+    capturePayload: unknown;
+    shippingSnapshot: unknown;
+    fulfillmentAddressOverride: unknown;
+    fulfillmentAddressOverrideReason: string | null;
+    fulfillmentAddressOverriddenAt: Date | null;
+    fulfillmentAddressOverriddenBy: string | null;
+    cartSnapshot: unknown;
+    initialCurrency: string | null;
+    paypalOrderId: string | null;
+    djangoOrderIntentUuid: string | null;
+    djangoOrderIntentOrderId: string | null;
+    djangoPaymentSaveCustomId: string | null;
+    merchizeFulfillmentResponsePayload: unknown;
+    merchizeFulfillmentProcessingId: string | null;
+    merchizeProviderOrderId: string | null;
+    merchizeProviderOrderCode: string | null;
+    processingCompletedAt: Date | null;
+    processingTriggeredAt: Date | null;
+    processingTriggerDetail: string | null;
+    processingTriggerSource: string | null;
+    checkoutSurfaceHost: string | null;
+    checkoutSurfaceOrigin: string | null;
+    checkoutSurfaceLabel: string | null;
+    postProcessingLockExpiresAt: Date | null;
+    status: string;
+    lastErrorMessage: string | null;
+    lastErrorCode: string | null;
+    lastEventType: string | null;
+    webhookEvents: PaidOrderRecoveryWebhookEvent[];
+    merchizeFulfillmentOps: MerchizeFulfillmentOpsAdminSummary | null;
+  },
+): PaidOrderRecoveryDetail {
   const originalAddress = normalizeAddress(row.shippingSnapshot);
   const overrideAddress = normalizeAddress(row.fulfillmentAddressOverride);
   const activeAddress = overrideAddress ?? originalAddress;
@@ -1025,7 +1097,14 @@ function buildDetail(row: {
     row.merchizeFulfillmentResponsePayload,
     row.merchizeFulfillmentOps?.syncStatus,
   );
+  const captureCompletion = getPayPalCaptureCompletion(row.capturePayload);
+  const canonicalPaymentChain = reconcileCanonicalPayPalPaymentChain(
+    row,
+    row.authorizePayload,
+    row.capturePayload,
+  );
   const requiresManualRelease =
+    canonicalPaymentChain.ok &&
     row.status === PAYPAL_LEDGER_STATUS.FULFILLMENT_ATTENTION_REQUIRED &&
     (row.lastErrorCode === 'MERCHIZE_PUSH_DISABLED_BY_CONFIG' ||
       row.lastErrorCode === 'MERCHIZE_MANUAL_RELEASE_REQUIRED' ||
@@ -1033,9 +1112,8 @@ function buildDetail(row: {
         MERCHIZE_FULFILLMENT_PRODUCTION_GATE_STATUS.PUSH_DISABLED ||
       row.merchizeFulfillmentOps?.productionGateStatus ===
         MERCHIZE_FULFILLMENT_PRODUCTION_GATE_STATUS.MANUAL_RELEASE_REQUIRED);
-  const captureCompletion = getPayPalCaptureCompletion(row.capturePayload);
   const fulfillmentRetryEligibility = getMerchizeFulfillmentRetryEligibility({
-    captureComplete: captureCompletion.ok,
+    captureComplete: captureCompletion.ok && canonicalPaymentChain.ok,
     hasAcceptedDjangoFulfillmentHandoff: acceptedDjangoHandoff,
     hasDjangoPaymentSaveCustomId: Boolean(row.djangoPaymentSaveCustomId),
     hasMerchizeExternalOrderNumber: Boolean(acceptedMerchizeExternalOrderNumber),
@@ -1067,12 +1145,18 @@ function buildDetail(row: {
       ? formatLongDate(row.fulfillmentAddressOverriddenAt)
       : null,
     addressOverriddenBy: row.fulfillmentAddressOverriddenBy,
-    items: getCartItems(row.cartSnapshot, row.initialCurrency),
+    items: getRecoveryOrderItems(row),
     references: [
       { label: 'Ledger order token', value: row.orderToken },
       { label: 'Authenticated user ID', value: row.userId },
       { label: 'PayPal order ID', value: row.paypalOrderId },
       { label: 'PayPal capture proof', value: captureCompletion.reason },
+      {
+        label: 'Canonical payment proof',
+        value: canonicalPaymentChain.ok
+          ? canonicalPaymentChain.capture.reason
+          : canonicalPaymentChain.reconciliation.reason,
+      },
       {
         label: 'Processing source',
         value: row.processingTriggerSource ?? inferredProcessingSource?.label ?? null,
@@ -1154,7 +1238,10 @@ function buildDetail(row: {
     },
     webhookEvents: row.webhookEvents,
     scannerState: getScannerState(row),
-    retryMode: row.processingCompletedAt ? 'none' : fulfillmentRetryEligibility.mode,
+    retryMode:
+      row.processingCompletedAt || !canonicalPaymentChain.ok
+        ? 'none'
+        : fulfillmentRetryEligibility.mode,
     merchizeFulfillmentOps: row.merchizeFulfillmentOps,
     needsProviderDetailSync: providerDetailSyncNeeded,
     requiresManualRelease,
@@ -1175,9 +1262,13 @@ function buildDetail(row: {
       merchizeFulfillmentOps: row.merchizeFulfillmentOps,
       needsProviderDetailSync: providerDetailSyncNeeded,
       requiresManualRelease,
-      retryMode: row.processingCompletedAt ? 'none' : fulfillmentRetryEligibility.mode,
+      retryMode:
+        row.processingCompletedAt || !canonicalPaymentChain.ok
+          ? 'none'
+          : fulfillmentRetryEligibility.mode,
       fulfillmentRetryEligibility,
       captureCompletion,
+      canonicalPaymentChain,
       scannerState: getScannerState(row),
       webhookEvents: row.webhookEvents,
       processingTriggerSource: row.processingTriggerSource,

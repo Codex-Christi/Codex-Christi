@@ -1,6 +1,10 @@
 import 'server-only';
 
 import type { Prisma } from '@/lib/prisma/shop/merchizeFulfillmentOps/generated/merchizeFulfillmentOps/client';
+import {
+  parseCanonicalOrderSnapshotFromLedger,
+  type CanonicalOrderSnapshotLedgerEnvelope,
+} from '@/lib/paypal/orderSnapshot/canonicalize';
 import { redactEmail, redactOperationalPayload } from './redaction';
 
 type JsonRecord = Record<string, unknown>;
@@ -135,31 +139,43 @@ export function summarizeProviderRequest(payload: unknown): Prisma.InputJsonValu
   return toPrismaJson(redactOperationalPayload(payload));
 }
 
-export function buildRegistrationSummaries(input: {
-  customerEmail?: string | null;
-  shippingSnapshot?: unknown;
-  cartSnapshot?: unknown;
-}) {
+export function buildRegistrationSummaries(
+  input: CanonicalOrderSnapshotLedgerEnvelope & {
+    customerEmail?: string | null;
+    shippingSnapshot?: unknown;
+    cartSnapshot?: unknown;
+  },
+) {
+  const parsedSnapshot = parseCanonicalOrderSnapshotFromLedger(input);
   const shipping = asRecord(input.shippingSnapshot);
-  const cartItems = Array.isArray(input.cartSnapshot) ? input.cartSnapshot : [];
-  const totalQuantity = cartItems.reduce((sum, item) => {
-    const quantity = asNumber(asRecord(item)?.quantity) ?? 0;
-    return sum + quantity;
-  }, 0);
+  const canonicalSnapshot = parsedSnapshot.snapshot;
+  const cartItems =
+    parsedSnapshot.mode === 'legacy' && Array.isArray(input.cartSnapshot) ? input.cartSnapshot : [];
+  const totalQuantity = canonicalSnapshot
+    ? canonicalSnapshot.lines.reduce((sum, line) => sum + line.quantity, 0)
+    : cartItems.reduce((sum, item) => {
+        const quantity = asNumber(asRecord(item)?.quantity) ?? 0;
+        return sum + quantity;
+      }, 0);
 
-  const orderCurrency =
-    firstString(cartItems[0], [['itemDetail', 'currency'], ['currency']]) ??
-    firstString(input.cartSnapshot, [
-      [0, 'itemDetail', 'currency'],
-      [0, 'currency'],
-    ]);
+  const orderCurrency = canonicalSnapshot
+    ? canonicalSnapshot.currency
+    : (firstString(cartItems[0], [['itemDetail', 'currency'], ['currency']]) ??
+      firstString(input.cartSnapshot, [
+        [0, 'itemDetail', 'currency'],
+        [0, 'currency'],
+      ]));
 
   return {
     customerEmailRedacted: redactEmail(input.customerEmail),
     shippingCity: asString(shipping?.shipping_city),
-    shippingState: asString(shipping?.shipping_state),
-    shippingCountry: asString(shipping?.shipping_country),
-    itemCount: cartItems.length,
+    shippingState: canonicalSnapshot
+      ? canonicalSnapshot.destination.region
+      : asString(shipping?.shipping_state),
+    shippingCountry: canonicalSnapshot
+      ? canonicalSnapshot.destination.countryIso3
+      : asString(shipping?.shipping_country),
+    itemCount: canonicalSnapshot?.lines.length ?? cartItems.length,
     totalQuantity,
     orderCurrency,
   };

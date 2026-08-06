@@ -6,6 +6,12 @@ export interface BasicProductInterface {
     image: string;
     retail_price: string;
     slug: string;
+    is_active?: boolean;
+    is_deleted?: boolean;
+    is_private?: boolean;
+    is_taken_down?: boolean;
+    approval_status?: string;
+    status?: string;
   };
 }
 
@@ -61,7 +67,12 @@ export interface ProductVariantsInterface {
     title: string;
     options: ProductVariantOptions;
     sku: string;
+    sku_seller?: string;
     product: string;
+    is_active?: boolean;
+    is_deleted?: boolean;
+    is_hidden?: boolean;
+    status?: string;
   }[];
 }
 

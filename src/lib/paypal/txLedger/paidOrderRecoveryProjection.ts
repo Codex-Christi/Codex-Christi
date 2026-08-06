@@ -1,6 +1,6 @@
 import 'server-only';
 
-import { getPayPalCaptureCompletion } from '@/lib/paypal/txLedger/captureCompletion';
+import { getCanonicalPaymentProjectionState } from '@/lib/paypal/txLedger/canonicalPaymentProjectionState';
 import { isAcceptedDjangoFulfillmentProcessResponse } from '@/lib/paypal/txLedger/fulfillmentProcessResponse';
 import {
   getPayPalLedgerInferredProcessingSourceDisplay,
@@ -297,7 +297,11 @@ function getProjectionLedgerRow(orderToken: string) {
       customerEmail: true,
       customerName: true,
       status: true,
+      authorizePayload: true,
       capturePayload: true,
+      canonicalOrderSnapshot: true,
+      canonicalOrderSnapshotVersion: true,
+      canonicalOrderSnapshotHash: true,
       initialCurrency: true,
       merchizeFulfillmentResponsePayload: true,
       merchizeProviderOrderId: true,
@@ -380,21 +384,25 @@ function buildProjectionData({
   merchizeOpsRow: ProjectionMerchizeOpsRow | null;
   webhookRow: ProjectionWebhookRow | null;
 }): Prisma.PaidOrderRecoveryProjectionUncheckedCreateInput {
-  const captureCompletion = getPayPalCaptureCompletion(ledgerRow.capturePayload);
-  const isPaid = captureCompletion.ok;
+  const paymentState = getCanonicalPaymentProjectionState(ledgerRow);
+  const { isPaid, paymentFailure, paymentSafeForPostProcessing } = paymentState;
   const providerDetailSyncNeeded = needsProviderDetailSync(
     ledgerRow.merchizeFulfillmentResponsePayload,
     merchizeOpsRow?.syncStatus,
   );
-  const adminRecoveryStatus = getAdminRecoveryStatus({
-    ledgerStatus: ledgerRow.status,
-    needsProviderDetailSync: providerDetailSyncNeeded,
-  });
+  const adminRecoveryStatus = paymentFailure
+    ? 'failed'
+    : getAdminRecoveryStatus({
+        ledgerStatus: ledgerRow.status,
+        needsProviderDetailSync: providerDetailSyncNeeded,
+      });
   const isResolved =
-    ledgerRow.status === PAYPAL_LEDGER_STATUS.COMPLETED ||
-    ledgerRow.status === PAYPAL_LEDGER_STATUS.REFUNDED ||
-    Boolean(ledgerRow.processingCompletedAt);
+    !paymentFailure &&
+    (ledgerRow.status === PAYPAL_LEDGER_STATUS.COMPLETED ||
+      ledgerRow.status === PAYPAL_LEDGER_STATUS.REFUNDED ||
+      Boolean(ledgerRow.processingCompletedAt));
   const isQueueVisible =
+    Boolean(paymentFailure) ||
     ADMIN_RECOVERY_LEDGER_STATUSES.includes(
       ledgerRow.status as (typeof ADMIN_RECOVERY_LEDGER_STATUSES)[number],
     ) || providerDetailSyncNeeded;
@@ -403,9 +411,10 @@ function buildProjectionData({
     !isResolved &&
     Boolean(ledgerRow.djangoOrderIntentOrderId) &&
     Boolean(ledgerRow.djangoOrderIntentVerifyPayload) &&
-    CUSTOMER_PROTECTION_LEDGER_STATUSES.includes(
-      ledgerRow.status as (typeof CUSTOMER_PROTECTION_LEDGER_STATUSES)[number],
-    );
+    (Boolean(paymentFailure) ||
+      CUSTOMER_PROTECTION_LEDGER_STATUSES.includes(
+        ledgerRow.status as (typeof CUSTOMER_PROTECTION_LEDGER_STATUSES)[number],
+      ));
   const latestWebhookSourceLabel = getWebhookSourceLabel(webhookRow);
   const processingSource = getPayPalLedgerProcessingSourceDisplay(
     {
@@ -428,8 +437,8 @@ function buildProjectionData({
     );
   const currentIssue = resolvePaidOrderRecoveryIssue({
     ledgerIssue: {
-      code: ledgerRow.lastErrorCode,
-      message: ledgerRow.lastErrorMessage,
+      code: paymentFailure?.errorCode ?? ledgerRow.lastErrorCode,
+      message: paymentFailure?.reason ?? ledgerRow.lastErrorMessage,
     },
     providerIssue: merchizeOpsRow
       ? {
@@ -463,18 +472,22 @@ function buildProjectionData({
     isCustomerProtectionVisible,
     isResolved,
     needsProviderDetailSync: providerDetailSyncNeeded,
-    needsAdminAttention: ['failed', 'attention', 'sync'].includes(adminRecoveryStatus),
+    needsAdminAttention:
+      Boolean(paymentFailure) ||
+      ['failed', 'attention', 'sync'].includes(adminRecoveryStatus),
     canRetryFullPostProcessing:
       isPaid &&
+      paymentSafeForPostProcessing &&
       !isResolved &&
       !providerDetailSyncNeeded &&
       FULL_POST_PROCESSING_RETRY_STATUSES.has(ledgerRow.status),
     canRetryFulfillment:
       isPaid &&
+      paymentSafeForPostProcessing &&
       !isResolved &&
       !providerDetailSyncNeeded &&
       FULFILLMENT_RETRY_STATUSES.has(ledgerRow.status),
-    canSyncProviderDetails: providerDetailSyncNeeded,
+    canSyncProviderDetails: paymentSafeForPostProcessing && providerDetailSyncNeeded,
     merchizeExternalOrderNumber,
     merchizeOrderId: merchizeOpsRow?.merchizeOrderId ?? ledgerRow.merchizeProviderOrderId,
     merchizeOrderCode: merchizeOpsRow?.merchizeOrderCode ?? ledgerRow.merchizeProviderOrderCode,
@@ -484,7 +497,11 @@ function buildProjectionData({
     merchizeDeliveryStatus: merchizeOpsRow?.deliveryStatus,
     receiptLink: ledgerRow.receiptLink,
     receiptFile: ledgerRow.receiptFile,
-    paidAmountLabel: getCaptureAmountLabel(ledgerRow.capturePayload, ledgerRow.initialCurrency),
+    // This projection field is rendered as "Paid" in customer/admin recovery surfaces, so it is
+    // populated only from completed PayPal capture evidence.
+    paidAmountLabel: paymentState.captureCompletion.ok
+      ? getCaptureAmountLabel(ledgerRow.capturePayload, ledgerRow.initialCurrency)
+      : null,
     processingSourceLabel: processingSource.label,
     processingSourceTone: processingSource.tone,
     checkoutSurfaceHost: ledgerRow.checkoutSurfaceHost,

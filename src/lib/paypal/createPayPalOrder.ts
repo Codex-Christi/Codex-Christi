@@ -1,20 +1,18 @@
 import 'server-only';
-import {
-  OrdersController,
-  CheckoutPaymentIntent,
-  OrderRequest,
-  ItemCategory,
-  Item,
-  Order,
-} from '@paypal/paypal-server-sdk';
+
+import { OrdersController, type Order } from '@paypal/paypal-server-sdk';
+import { parseCanonicalOrderSnapshot } from '@/lib/paypal/orderSnapshot/canonicalize';
 import { getPayPalClient } from '@/lib/paymentClients/paypalClient';
-import { getOrderFinalDetails } from '@/actions/shop/checkout/getOrderFinalDetails';
-import { PAYPAL_CURRENCY_CODES } from '@/datasets/shop_general/paypal_currency_specifics';
-import { removeOrKeepDecimalPrecision } from '@/actions/merchize/getMerchizeTotalWithShipping';
-import { format } from 'date-fns';
-import type { CartVariant } from '@/stores/shop_stores/cartStore';
-import type { ShopCheckoutStoreInterface } from '@/stores/shop_stores/checkoutStore';
-import { getShopSiteUrl } from '@/lib/siteBaseUrls';
+import {
+  buildPayPalOrderCreatePayload,
+  type BuildPayPalOrderCreatePayloadInput,
+} from './createPayPalOrderPayload';
+
+export {
+  buildPayPalOrderCreatePayload,
+  type BuildPayPalOrderCreatePayloadInput,
+  type PayPalOrderCreatePayload,
+} from './createPayPalOrderPayload';
 
 export interface BillingAddressInterface {
   addressLine1: string;
@@ -25,220 +23,33 @@ export interface BillingAddressInterface {
   postalCode: string;
 }
 
-export interface CreateOrderActionInterface {
-  orderToken: string;
-  cart: CartVariant[];
-  customer: { name: string; email: string };
-  country: string;
-  country_iso_3: string;
-  initialCurrency: string;
-  delivery_address: ShopCheckoutStoreInterface['delivery_address'];
-}
-
-export class CheckoutLivePricingUnavailableError extends Error {
-  code = 'LIVE_PRICING_UNAVAILABLE' as const;
-  status = 503;
-
-  constructor() {
-    super(
-      'Checkout is temporarily unavailable because live product pricing could not be verified. Please try again shortly.',
-    );
-    this.name = 'CheckoutLivePricingUnavailableError';
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-// Define the no shipping preference for PayPal
-const shippingPreferenceForPaymentContext = {
-  experienceContext: {
-    shippingPreference: 'SET_PROVIDED_ADDRESS',
-    brandName: 'Codex Christi',
-  },
-};
+export type CreateOrderActionInterface = BuildPayPalOrderCreatePayloadInput;
 
 export async function createPayPalOrder(body: CreateOrderActionInterface): Promise<Order> {
-  const { orderToken, cart, customer, country, country_iso_3, initialCurrency, delivery_address } =
-    body;
+  const { orderToken, canonicalOrderSnapshot, customer, delivery_address } = body;
 
   if (!orderToken) {
     throw new Error('Missing order token');
   }
-  if (!cart) {
-    throw new Error('Missing cart');
-  }
-  if (!Array.isArray(cart)) {
-    throw new Error('Cart must be an array');
-  }
-  if (!delivery_address) {
-    throw new Error('Missing delivery address!');
-  }
-  if (cart.length === 0) {
-    throw new Error('Cart cannot be empty');
-  }
-  if (
-    !cart.every(
-      (item) => item && typeof item === 'object' && 'variantId' in item && 'quantity' in item,
-    )
-  ) {
-    throw new Error('Each cart item must be a valid CartVariant with id and quantity');
+  if (!canonicalOrderSnapshot) {
+    throw new Error('Missing canonical order snapshot');
   }
   if (!customer) {
     throw new Error('Missing customer');
   }
-
-  // To check if paypal supports country's currency
-  const payPalSupportsCurrency = PAYPAL_CURRENCY_CODES.includes(
-    initialCurrency as (typeof PAYPAL_CURRENCY_CODES)[number],
-  );
-
-  // 🛡 Validate cart on server (don't trust client prices)
-  const orderDetailsFromServer = await getOrderFinalDetails(
-    cart,
-    country_iso_3 ? country_iso_3 : 'USA',
-    'merchize',
-  );
-  const { finalPricesWithShippingFee } = orderDetailsFromServer || {};
-  const { currency, retailPriceTotalNum, shippingPriceNum, multiplier } =
-    finalPricesWithShippingFee || {};
-  const retailPriceSource =
-    finalPricesWithShippingFee && 'retailPriceSource' in finalPricesWithShippingFee
-      ? finalPricesWithShippingFee.retailPriceSource
-      : undefined;
-
-  if (retailPriceSource !== 'live') {
-    throw new CheckoutLivePricingUnavailableError();
+  if (!delivery_address) {
+    throw new Error('Missing delivery address!');
   }
 
-  // Extract the currency code, defaulting to 'USD' if not supported
-  // or if the currency is not provided
-  const currencyCode = currency && payPalSupportsCurrency ? currency : 'USD';
+  // Fail closed if a caller passes a stale, malformed, or hash-mismatched snapshot.
+  const verifiedSnapshot = parseCanonicalOrderSnapshot(canonicalOrderSnapshot);
+  const payload = buildPayPalOrderCreatePayload({
+    ...body,
+    canonicalOrderSnapshot: verifiedSnapshot,
+  });
 
-  // Adjust total and shipping prices and item prices based on currency
-  const getAdjAmount = (num: number) => (payPalSupportsCurrency ? num : num / (multiplier ?? 1));
+  const orders = new OrdersController(getPayPalClient());
+  const { result } = await orders.createOrder(payload);
 
-  // const adjTotal = getAdjAmount(retailPriceTotalNum!);
-  const adjShipping = getAdjAmount(shippingPriceNum!);
-
-  // Traverse, copy and format cart for context
-  const cartItemsForPaypalBodyContext = cart.map(
-    async ({ title, itemDetail, quantity }) =>
-      ({
-        name: title,
-        unitAmount: {
-          currencyCode: currency,
-          value: String(
-            await removeOrKeepDecimalPrecision(
-              currency!,
-              getAdjAmount(itemDetail.retail_price * (multiplier ?? 1)),
-            ),
-          ),
-        },
-        quantity: String(quantity),
-        description: title,
-        sku: itemDetail.sku_seller,
-        url: getShopSiteUrl(`/product/${itemDetail.product}`),
-        category: ItemCategory.PhysicalGoods,
-      }) as Item,
-  );
-
-  if (retailPriceTotalNum && shippingPriceNum) {
-    // Calculate total amount with shipping
-    // const totalAmountWithShipping = Number(adjTotal) + Number(adjShipping); // TODO: calculate securely from SKU/DB
-
-    // Resolve all cart items to ensure they are ready for the order payload
-    const resolvedCartItems = await Promise.all(cartItemsForPaypalBodyContext);
-
-    const itemsContextTotal = await removeOrKeepDecimalPrecision(
-      currencyCode,
-      resolvedCartItems.reduce(
-        (accum, itm) => accum + Number(itm.unitAmount.value) * Number(itm.quantity),
-        0,
-      ),
-    );
-
-    // Create the order payload
-    // Note: `currencyCode` is used for the currency of the order
-    // and `value` is the total amount for the order.
-
-    const payload = {
-      body: {
-        intent: 'AUTHORIZE' as CheckoutPaymentIntent,
-        purchaseUnits: [
-          {
-            description: `Codex Christi Shop Order for ${customer.name} on ${format(
-              new Date(Date.now()),
-              "EEEE d 'of' MMMM yyyy hh:mm a",
-            )}`,
-            amount: {
-              currencyCode,
-              value: String(
-                await removeOrKeepDecimalPrecision(currencyCode, itemsContextTotal + adjShipping),
-              ),
-              breakdown: {
-                itemTotal: {
-                  currencyCode: currencyCode,
-                  value: String(itemsContextTotal),
-                },
-                shipping: {
-                  currencyCode,
-                  value: String(await removeOrKeepDecimalPrecision(currencyCode, adjShipping)),
-                },
-              },
-            },
-            shipping: {
-              name: {
-                fullName: customer.name,
-              },
-              address: {
-                addressLine1: delivery_address.shipping_address_line_1,
-                addressLine2: delivery_address.shipping_address_line_2,
-                adminArea1: delivery_address.shipping_state,
-                adminArea2:
-                  // delivery_address.shipping_city!.length > 2 ?
-                  delivery_address.shipping_city,
-                // : undefined,
-                postalCode: delivery_address.zip_code,
-                countryCode: country,
-              },
-
-              emailAddress: customer.email,
-            },
-            // PayPal echoes this as custom_id in some webhooks. Locally it is the ledger orderToken,
-            // not Django's payment-save custom_id.
-            customId: orderToken,
-            items: payPalSupportsCurrency
-              ? // && !currencyCodesWithoutDecimalPrecision.includes(currencyCode)
-                resolvedCartItems
-              : undefined,
-            // Send items if paypal supports currency and currency has decimal precision
-          },
-        ],
-        payer: {
-          name: { givenName: customer.name },
-          emailAddress: customer.email,
-        },
-        paymentSource: {
-          paypal: shippingPreferenceForPaymentContext,
-          card: {
-            experienceContext: shippingPreferenceForPaymentContext.experienceContext,
-            attributes: {
-              verification: {
-                method: 'SCA_WHEN_REQUIRED',
-              },
-            },
-          },
-          venmo: shippingPreferenceForPaymentContext,
-        },
-      } as OrderRequest,
-      prefer: 'return=representation',
-    };
-
-    // Order Creation time...
-    const orders = new OrdersController(getPayPalClient());
-    const { result } = await orders.createOrder(payload);
-
-    return result;
-  } else {
-    throw new Error('Invalid Price!! Aborting...');
-  }
+  return result;
 }

@@ -11,8 +11,9 @@ import { safeLogErrorMessage } from './redaction';
 import { registerAcceptedMerchizeFulfillmentProcess } from './registerAcceptedMerchizeFulfillmentProcess';
 import { syncMerchizeFulfillmentOrder } from './syncMerchizeFulfillmentOrder';
 import type { MerchizeFulfillmentRegistrationInput } from './merchizeTypes';
+import type { CanonicalOrderSnapshotLedgerEnvelope } from '@/lib/paypal/orderSnapshot/canonicalize';
 
-type AddressCorrectionLedgerEvidence = {
+type AddressCorrectionLedgerEvidence = CanonicalOrderSnapshotLedgerEnvelope & {
   orderToken: string;
   paypalOrderId: string | null;
   djangoOrderIntentUuid: string | null;
@@ -133,11 +134,7 @@ async function ensureMerchizeFulfillmentAddressCorrectionTarget(
 export async function resolveMerchizeFulfillmentAddressCorrectionTarget(
   evidence: AddressCorrectionLedgerEvidence,
 ): Promise<AddressCorrectionResolution> {
-  if (
-    !isAcceptedDjangoFulfillmentProcessResponse(
-      evidence.merchizeFulfillmentResponsePayload,
-    )
-  ) {
+  if (!isAcceptedDjangoFulfillmentProcessResponse(evidence.merchizeFulfillmentResponsePayload)) {
     return {
       ok: true,
       providerUpdateRequired: false,
@@ -154,11 +151,10 @@ export async function resolveMerchizeFulfillmentAddressCorrectionTarget(
     };
   }
 
-  const merchizeExternalOrderNumber =
-    extractMerchizeExternalOrderNumberFromDjangoProcessResponse(
-      evidence.merchizeFulfillmentResponsePayload,
-      evidence.djangoOrderIntentOrderId,
-    );
+  const merchizeExternalOrderNumber = extractMerchizeExternalOrderNumberFromDjangoProcessResponse(
+    evidence.merchizeFulfillmentResponsePayload,
+    evidence.djangoOrderIntentOrderId,
+  );
 
   if (!merchizeExternalOrderNumber) {
     return {
@@ -178,13 +174,15 @@ export async function resolveMerchizeFulfillmentAddressCorrectionTarget(
     fulfillmentIdentifier: CODEX_CHRISTI_FULFILLMENT_IDENTIFIER,
     merchizeExternalOrderNumber,
     merchizeOrderId: null,
-    merchizeOrderCode:
-      evidence.merchizeProviderOrderCode ?? merchizeExternalOrderNumber,
+    merchizeOrderCode: evidence.merchizeProviderOrderCode ?? merchizeExternalOrderNumber,
     merchizeStatus: null,
     djangoProcessResponsePayload: evidence.merchizeFulfillmentResponsePayload,
     customerEmail: evidence.customerEmail,
     shippingSnapshot: evidence.correctedShippingSnapshot,
     cartSnapshot: evidence.cartSnapshot,
+    canonicalOrderSnapshot: evidence.canonicalOrderSnapshot,
+    canonicalOrderSnapshotVersion: evidence.canonicalOrderSnapshotVersion,
+    canonicalOrderSnapshotHash: evidence.canonicalOrderSnapshotHash,
   });
 
   if (!target.ok) {

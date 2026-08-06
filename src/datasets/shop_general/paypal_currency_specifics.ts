@@ -58,3 +58,6 @@ export const PAYPAL_CURRENCY_CODES = [
   'THB', // Thai baht
   'USD', // US dollar
 ] as const;
+
+/** PayPal-specific zero-digit currencies. Decimal amounts are rejected by PayPal for these. */
+export const PAYPAL_ZERO_DIGIT_CURRENCY_CODES = ['HUF', 'JPY', 'TWD'] as const;

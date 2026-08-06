@@ -9,6 +9,85 @@ Runtime checkpoint for paid order fulfillment processing naming and push-to-fulf
 
 Shop Ops runtime-target and scoped recovery hardening checkpoint: 2026-07-24
 
+Release sequencing checkpoint: 2026-07-27
+
+P0.2 canonical-order checkpoint: 2026-08-06. Implementation and local repository verification pass.
+No configured database was mutated. Migration deployment and deployed sandbox/E2E verification are
+pending, so the release gate remains open.
+
+`SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md` is canonical for public-alpha priority, cross-domain release
+gates, secure confirmation access, customer milestones, and E2E testing. This guide remains
+authoritative for PayPal ledger contracts and payment-side idempotency. Older implementation-order
+sections are historical/domain detail and do not override the release guide.
+
+## P0.2 canonical order ledger checkpoint
+
+The current implementation adds one sealed source of order truth without replacing the existing
+ledger or creating a standalone order database:
+
+- `PaypalIntent.canonicalOrderSnapshot Json?`
+- `PaypalIntent.canonicalOrderSnapshotVersion String?`
+- `PaypalIntent.canonicalOrderSnapshotHash String?`
+- migration `prisma/shop/paypal/migrations/20260806000000_add_canonical_order_snapshot/migration.sql`
+  adds the fields and a check constraint requiring the three values to be all null or all non-null;
+- all three null means a pre-P0.2 legacy row and preserves the old processing path;
+- any partial envelope, invalid shape/arithmetic, hash failure, or version/hash metadata mismatch is
+  corruption and fails closed. It must never fall back to `cartSnapshot`;
+- new intent creation treats browser product ID, variant ID, and quantity as lookup selectors only.
+  Trusted server/provider data owns product relationships, SKUs, current price/currency, and
+  reproducible shipping;
+- explicit inactive/deleted/private/taken-down/unapproved product evidence or explicit
+  inactive/deleted/hidden/draft/retired variant evidence blocks intent creation without introducing
+  an arbitrary product/SKU allowlist;
+- selector input is bounded before provider work to 25 rows, 128 characters per identifier, 25
+  units per merged line, and 100 units total. Duplicate selectors are merged and rechecked; each
+  unique product resolves once with at most four concurrent workers, then catalog SKUs resolve in
+  one strict batch;
+- PayPal creation uses only canonical lines, subtotal, shipping, currency, and total. Missing or
+  unproven SKU data, catalog mismatch, an unsafe shipping fallback, or an invalid quote stops intent
+  creation;
+- authorization persists its provider evidence, but keeps `status = authorized` only after exact
+  total/currency reconciliation. Invalid canonical metadata or mismatch records `status = error` with
+  `CANONICAL_ORDER_SNAPSHOT_INVALID` or `PAYPAL_AUTHORIZATION_AMOUNT_MISMATCH` and returns `409`;
+- before a new capture, the route re-reconciles the persisted authorization, uses stable request id
+  `capture:{orderToken}`, requires completed capture evidence, then reconciles exact captured total
+  and currency. Invalid metadata or mismatch records `status = error` with
+  `CANONICAL_ORDER_SNAPSHOT_INVALID` or `PAYPAL_CAPTURE_AMOUNT_MISMATCH`, returns `409`, and does not
+  schedule post-processing;
+- stored authorization/capture replay, PayPal webhook reconciliation, payment recovery, scanners,
+  mutating admin recovery, and `runPaidFulfillmentProcessing` use the same full
+  authorization-plus-capture chain. A matching capture cannot hide an authorization mismatch, and
+  the runner checks the chain before either full or fulfillment-only side effects;
+- authorization-route, capture-route, webhook, and payment-reconciliation evidence writes re-read
+  the latest row and commit with `updatedAt` and status compare-and-swap. They rebuild on a conflict
+  before scheduling anything, preserve durable signed authorization and capture mismatches across
+  later contradictory success or failure responses, persist direct authorization evidence/ID,
+  inspect delayed payment evidence even after completion, and prevent stale pending, missing-
+  reference, or timeout results from regressing post-capture state;
+- canonical receipt lines/totals, Django payment-save `amount_received`, and Django/Merchize
+  fulfillment items come from the same snapshot. They do not mix canonical totals with mutable
+  PayPal/browser-cart lines;
+- customer/admin recovery displays and Merchize Ops registration prefer a valid canonical snapshot;
+  raw-cart behavior is retained only for the all-null legacy envelope. A field labeled as paid uses
+  actual completed PayPal capture money, never the expected canonical total; mismatches are review
+  incidents.
+
+Local verification covers the repository source test suite for this isolated P0.2 change (132
+tests), TypeScript, ESLint, a production webpack build, checked-in Prisma 7.8 generated-client
+field/type wiring, dev/prod schema
+validation, a disposable-PostgreSQL full-chain migration smoke test, and diff checks. Production has only
+`20260806000000_add_canonical_order_snapshot` pending. Development has that migration pending plus a
+pre-existing history-name divergence: remote-only
+`20260622190331_add_paypal_ledger_transaction_webhook_bindings` versus repository migration
+`20260622190000_add_paypal_ledger_transaction_webhook_bindings`. Reconcile development history
+before migration deployment.
+
+The snapshot intentionally contains merchandise plus shipping only. The current PayPal account
+cannot charge tax, so there is no tax amount or tax line in the canonical snapshot, PayPal purchase
+unit, or receipt. P0.2 also preserves the existing multi-currency and destination behavior; missing
+trusted order data may block an individual intent, but this checkpoint does not create a new
+destination policy.
+
 Implemented in the current code checkpoint:
 
 - The Django fulfillment process endpoint is no longer treated as successful from HTTP 2xx alone.
@@ -75,7 +154,8 @@ Move post-payment processing (receipt generation/upload, payment save, fulfillme
 ## Non-goals
 
 - Rewriting your entire checkout UI.
-- Replacing your existing PayPal order creation route.
+- Rewriting the PayPal provider/client integration beyond making ledger intent plus the canonical
+  server snapshot authoritative for order creation.
 - Replacing your OTP flow.
 
 ## Ground rules for this guide
@@ -85,6 +165,9 @@ Move post-payment processing (receipt generation/upload, payment save, fulfillme
 - Do **not** require a separate Prisma config file for the PayPal ledger schema.
 - Keep status fields as strings for now (Prisma enum deferred).
 - Isolate fulfillment-provider details behind a ledger runner adapter boundary.
+- Preserve the existing PayPal currencies and destination behavior during canonical-snapshot work.
+- Do not calculate, add, collect, or pass a tax amount or tax line to PayPal. Tax capability is not
+  available in the current PayPal setup.
 
 ---
 
@@ -110,10 +193,14 @@ Move post-payment processing (receipt generation/upload, payment save, fulfillme
 
 ## 2.2 PayPal order creation
 
-- `src/components/UI/Shop/Checkout/Paypal/PayPalCheckoutChildren.tsx` calls `createOrderAction(...)`.
-- `src/actions/shop/paypal/createOrderAction.ts` decrypts payload and calls:
-  - `/next-api/paypal/orders/create-order`
-- `src/app/api/paypal/orders/create-order/route.ts` validates pricing via `getOrderFinalDetails(...)` and creates the PayPal order.
+- `src/components/UI/Shop/Checkout/Paypal/PayPalCheckoutChildren.tsx` posts product ID, variant ID,
+  and quantity lookup selectors to `/next-api/paypal/tx-ledger/intent`.
+- The intent route resolves trusted server/provider product, variant, SKU, price, currency, and
+  shipping data, seals the canonical snapshot, creates the ledger row, and creates the PayPal order.
+- `src/lib/paypal/createPayPalOrder.ts` accepts the verified snapshot; it does not resolve or trust
+  browser cart pricing.
+- `src/lib/paypal/createPayPalOrderPayload.ts` builds all PayPal items and monetary fields from the
+  snapshot and contains no tax amount or tax line.
 
 ## 2.3 Approve, authorize, capture
 
@@ -162,7 +249,9 @@ Current state:
 
 ## Boundaries that should remain stable
 
-- Existing `/next-api/paypal/orders/create-order` route behavior (same inputs/outputs, logic extracted to shared function).
+- `/next-api/paypal/tx-ledger/intent` remains the browser-facing order-initialization owner;
+  `createPayPalOrder` receives an already verified canonical snapshot and must not regain browser
+  cart/price resolution.
 - Existing `/next-api/paypal/orders/authorize` and `/capture` endpoints as the ownership point for authorize/capture.
 - OTP verification backend contract.
 - Merchize SQLite catalog DB and its Prisma config.
@@ -357,6 +446,9 @@ model PaypalIntent {
   initialCurrency                    String?
   cartSnapshot                       Json
   shippingSnapshot                   Json
+  canonicalOrderSnapshot             Json?
+  canonicalOrderSnapshotVersion      String?
+  canonicalOrderSnapshotHash         String?
   // Raw payloads needed to reuse your existing server actions
   authorizePayload                   Json?
   capturePayload                     Json?
@@ -491,6 +583,21 @@ yarn prisma migrate dev \
   --schema prisma/shop/paypal/paypalTXLedger.schema.prisma \
   --name init_paypal_tx_ledger
 ```
+
+## P0.2 additive canonical snapshot migration
+
+The checked-in migration is:
+
+```text
+prisma/shop/paypal/migrations/20260806000000_add_canonical_order_snapshot/migration.sql
+```
+
+It adds the three nullable fields and the
+`PaypalIntent_canonicalOrderSnapshot_complete` check constraint. Existing rows are not backfilled:
+the all-null triple is the only supported legacy envelope. The SQL and both target-selected schemas
+have passed local validation without mutating a configured database. Production has this migration
+pending. Development has it pending but also has the pre-existing webhook-binding migration-name
+divergence documented in the P0.2 checkpoint above; reconcile that history before deploy.
 
 ## Deploy migrations (production)
 
@@ -651,6 +758,16 @@ Design note:
 ---
 
 # 13) PayPal Intent Endpoint (server)
+
+P0.2 supersession notice: the current intent route does **not** accept browser cart descriptions,
+prices, SKUs, shipping totals, country codes, or currency as authoritative order data. It accepts
+`selections` containing only product ID, variant ID, and quantity, resolves and seals the canonical
+snapshot server-side, persists all three canonical ledger fields, and passes that verified snapshot
+to `createPayPalOrder`. Selection/identifier/quantity budgets and max-four unique-product
+concurrency prevent a public request from amplifying into unbounded provider work. Trusted
+publication state rejects unavailable products/variants without creating a separate allowlist. The
+older code templates in 13a/13b are retained as historical structure only and must not be copied
+over the current implementation.
 
 ## 13a) Extract create-order logic into a shared function
 
@@ -999,12 +1116,15 @@ Important behavior:
 
 ## Required payload sources (codebase-verified)
 
-- `cart` from `useCartStore`
+- product ID, variant ID, and quantity selectors derived from `useCartStore`; do not send browser
+  title, SKU, option, price, currency, or shipping fields as order truth
 - `customer` + `delivery_address` from `useShopCheckoutStore`
-- `country_iso2`, `country_iso3`, `currency` from `ServerOrderDetailsContext`
 - `djangoOrderIntentUuid`, `djangoOrderIntentOrderId`, and `djangoOrderIntentVerifyPayload` from `djangoOrderIntentStore`
 
 ## Template (drop-in replacement shape)
+
+This is the older pre-P0.2 integration shape. The current component sends `selections` and omits
+client-owned country/currency/price fields; preserve that current contract.
 
 ```ts
 import { useDjangoOrderIntentStore } from '@/stores/shop_stores/checkoutStore/djangoOrderIntentStore';
@@ -1084,6 +1204,30 @@ Current file:
 
 - `src/app/api/paypal/orders/authorize/route.ts`
 
+## Current P0.2 authorization gate
+
+The implemented route:
+
+1. requires `orderToken` and `orderID`, loads the ledger row, and requires the stored PayPal order
+   ID to match;
+2. revalidates an already persisted authorization before returning its cached payload;
+3. when an earlier attempt left the row in `error`, reads the PayPal order first and adopts an
+   already-existing authorization instead of blindly authorizing again;
+4. rejects post-capture/terminal states and permits a provider authorize call only from
+   `intent_created` or the bounded `error` resync path;
+5. extracts authorization amount/currency and compares them exactly with the sealed snapshot total
+   before keeping `status = authorized`;
+6. on invalid/partial canonical metadata, records `CANONICAL_ORDER_SNAPSHOT_INVALID`; on exact money
+   mismatch, records `PAYPAL_AUTHORIZATION_AMOUNT_MISMATCH`. Both set `status = error` and return a
+   `409` reconciliation conflict;
+7. persists both provider success and route-failure outcomes through a fresh-row `updatedAt`/status
+   compare-and-swap, so a signed mismatch that lands during a PayPal call remains durable instead
+   of being replaced by the stale response;
+8. permits the legacy behavior only when snapshot, version, and hash are all null.
+
+The following older sample shows the original ledger-write shape only. It is not sufficient for the
+current runtime unless the state, resync, and canonical reconciliation gates above are preserved.
+
 Add `orderToken` in request body and persist:
 
 - `authorizePayload`
@@ -1151,6 +1295,42 @@ Current file:
 - `src/app/api/paypal/orders/capture/route.ts`
 
 This section needs the same hardening mindset as Section 15. The minimal "call PayPal, then write the DB row" shape is not enough on its own, because PayPal capture can succeed while ledger persistence fails afterward.
+
+## Current P0.2 capture gate
+
+The implemented route:
+
+1. requires `authorizationId` and `orderToken`, loads the ledger row, and rejects a mismatched stored
+   authorization ID;
+2. if a capture payload already exists, verifies that it represents a completed capture and
+   reconciles the full stored authorization-plus-capture chain before returning it or scheduling
+   follow-up work;
+3. otherwise permits the provider capture call only from `authorized` or the bounded `error` retry
+   path, and first reconciles the persisted authorization against the canonical snapshot;
+4. calls PayPal with the stable request id `capture:{orderToken}`;
+5. persists incomplete capture evidence as pending/refunded/error as appropriate and never treats it
+   as captured;
+6. after PayPal returns, requires completed capture evidence and exact authorization/capture
+   total/currency before setting `status = captured` or scheduling
+   `runPaidFulfillmentProcessing`;
+7. records canonical corruption or authorization/capture money mismatch as `status = error`, returns
+   `409`, and does not start downstream side effects;
+8. persists completed, incomplete, and generic failure observations through a fresh-row
+   compare-and-swap. A stale pending result or timeout cannot overwrite a concurrently completed
+   capture, and signed mismatch evidence remains durable;
+9. permits legacy behavior only for the all-null canonical field triple. Partial or corrupt metadata
+   is not legacy.
+
+Webhook capture/authorization handlers, payment reconciliation, scanners, the fulfillment runner,
+and mutating admin recovery actions apply the same full-chain rules, so bypassing the browser route
+cannot bypass the money gate. Pre-payment `intent_creating`/`intent_created` rows are not falsely
+classified as payment mismatches merely because PayPal evidence does not exist yet.
+
+Payment-reconciliation handlers do not make an intermediate provider-evidence write. Their
+authorization, capture, and missing-reference decisions are rebuilt from the newest ledger row and
+committed with the same compare-and-swap rule. Matching/stale observations preserve captured,
+receipt, payment-save, fulfillment, completed, and refunded states; only newly verified
+contradictory money evidence may reopen `error` for review.
 
 Required outcomes:
 
@@ -1805,6 +1985,12 @@ Note:
 
 ## Default idempotent webhook core template (merge into your route)
 
+P0.2 supersession notice: the code block below is retained only as the original template. Do not
+copy its unconditional `completed` early return or `PAYMENT.CAPTURE.PENDING` status write. The
+current route uses `buildPayPalWebhookLedgerTransition(...)` plus optimistic compare-and-swap so it
+can persist authorization evidence, inspect delayed contradictions on completed rows, retry a
+concurrent evidence change, and keep out-of-order pending events from regressing paid orders.
+
 ```ts
 import { after } from 'next/server';
 import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
@@ -2046,6 +2232,20 @@ Important:
 - The runner must not replay PayPal capture.
 - Completed prerequisites such as receipt upload and Django payment save must be detected by persisted artifacts and skipped.
 - Fulfillment completion means the provider subsequently verifies the order as pushed; the push POST acknowledgement and catalog import acceptance are both intermediate states.
+
+P0.2 adds a mandatory order-integrity gate before these side effects:
+
+- verify completed capture evidence and reconcile both authorization and capture amount/currency
+  against the sealed snapshot before either full processing or `merchize_fulfillment_only`
+  processing;
+- if the canonical envelope is partial, corrupt, or mismatched, stop at capture validation and do not
+  generate a receipt, save payment to Django, or hand items to fulfillment;
+- for a valid canonical row, create receipt lines/subtotal/shipping/total only from the snapshot,
+  save Django `amount_received` from snapshot total/currency, and map fulfillment items only from
+  snapshot SKUs/options/quantity/prices;
+- do not mix snapshot totals with PayPal/browser-cart lines;
+- only the all-null snapshot/version/hash triple may use the pre-P0.2 cart/PayPal compatibility path;
+- canonical totals are merchandise plus shipping only. Do not add, infer, label, or pass tax.
 
 **Important: server-only crypto**
 
@@ -2289,7 +2489,15 @@ Current file:
 
 - `src/lib/paypal/txLedger/sendMerchizeFulfillmentOrder.ts`
 
+Current P0.2 behavior: the helper accepts the verified canonical snapshot from the ledger runner and
+maps its lines directly to the Django/Merchize process payload. `cartSnapshot` mapping remains only
+for an all-null legacy row selected by the runner's canonical-envelope parser. A caller must not
+omit or discard an invalid canonical snapshot to force the legacy path.
+
 ## Ledger-facing helper shape
+
+The sample below is the older legacy shape. Preserve the current canonical-snapshot argument and
+mapping when adapting this helper.
 
 ```ts
 // src/lib/paypal/txLedger/sendMerchizeFulfillmentOrder.ts
@@ -2996,7 +3204,32 @@ Why this is safe:
 ## Local dev (no reliable webhook)
 
 - Create intent from checkout.
+- Verify product/variant/quantity are selectors only and that browser title, SKU, price, currency,
+  and shipping values cannot alter the sealed snapshot or PayPal payload.
+- Verify missing/unproven SKU, catalog mismatch, unsafe shipping fallback, and invalid shipping
+  quote stop intent creation.
+- Verify explicit inactive/deleted/private/taken-down/unapproved product evidence and explicit
+  inactive/deleted/hidden/draft/retired variant evidence stop intent creation.
+- Verify the 25-selector, 128-character-ID, 25-units-per-merged-line, and 100-total-unit limits are
+  enforced before provider work; duplicates resolve once, unique-product lookups never exceed four
+  concurrent workers, and catalog SKU proof is fetched in one strict batch.
 - Authorize/capture routes write ledger payloads.
+- Verify exact authorization and capture total/currency match succeeds; amount mismatch, currency
+  mismatch, missing provider money, partial canonical metadata, invalid hash, and external
+  version/hash mismatch fail closed without post-processing.
+- Verify a matching completed capture cannot hide an earlier authorization mismatch, including
+  recovery from a later PayPal order response that omits its authorization resource.
+- Verify an authorization-webhook race resynchronizes the full order payload; a signed mismatched
+  authorization followed by a matching capture stays blocked; delayed contradictory evidence on a
+  completed row becomes an incident; compare-and-swap rebuilds after a concurrent write; and an
+  out-of-order pending event cannot regress captured or later state.
+- Verify all-null pre-P0.2 rows retain legacy behavior and no other envelope can use it.
+- Verify PayPal purchase units, receipts, Django payment-save amount, and fulfillment items all use
+  the same snapshot and contain no tax amount or tax line.
+- Verify multiple currently supported currencies retain their existing decimal-precision behavior;
+  do not test or document an alpha-wide USD restriction.
+- Verify every field labeled as paid uses actual completed PayPal capture money while the canonical
+  total remains the expected order value; a difference is shown as a reconciliation incident.
 - Poll order status endpoint.
 - Use dev fallback endpoint to trigger `runPaidFulfillmentProcessing(orderToken)`.
 - Verify:

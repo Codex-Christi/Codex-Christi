@@ -8,6 +8,9 @@ import { OrdersCapture } from '@paypal/paypal-server-sdk';
 import { returnReducedBackendError } from '@/lib/hooks/shopHooks/checkout/helpers/returnReducedBackendError';
 import { decryptForPostProcessingServerAction } from '@/lib/utils/shop/checkout/serverPostProcessingCrypto';
 import { getServerDjangoApiBaseUrl } from '@/lib/django/getServerDjangoApiBaseUrl';
+import type { CanonicalOrderSnapshot } from '@/lib/paypal/orderSnapshot/types';
+import { parseCanonicalOrderSnapshot } from '@/lib/paypal/orderSnapshot/canonicalize';
+import { getCanonicalPaymentAmountReceived } from '@/lib/paypal/orderSnapshot/consumerData';
 
 const baseURL = getServerDjangoApiBaseUrl();
 
@@ -57,6 +60,7 @@ export interface PaymentSavingActionProps extends Omit<CompletedTxInterface, 'ca
   receiptFileName: string;
   finalCapturedOrder: OrdersCapture;
   capturedOrderPaypalID: string;
+  canonicalOrderSnapshot?: CanonicalOrderSnapshot | null;
 }
 
 export async function savePaymentDataToBackend(encProps: string) {
@@ -71,7 +75,14 @@ export async function savePaymentDataToBackend(encProps: string) {
     pdfReceiptLink,
     receiptFileName,
     finalCapturedOrder,
-  } = JSON.parse(decryptForPostProcessingServerAction(encProps)) as PaymentSavingActionProps;
+    canonicalOrderSnapshot,
+  } = JSON.parse(
+    decryptForPostProcessingServerAction(encProps),
+  ) as PaymentSavingActionProps;
+
+  const canonicalAmountReceived = canonicalOrderSnapshot
+    ? getCanonicalPaymentAmountReceived(parseCanonicalOrderSnapshot(canonicalOrderSnapshot))
+    : null;
 
   // Sub-destructuring (original comment)
   // The ledger stores PayPal server-SDK payloads, which use camelCase.
@@ -132,7 +143,8 @@ export async function savePaymentDataToBackend(encProps: string) {
         capturedOrderPaypalID,
         paymentAuthID: authData.id,
         custom_id: paypalPurchaseUnitCustomId,
-        amountReceived: amount ? `${amountValue} ${currencyCode}` : null,
+        amountReceived:
+          canonicalAmountReceived ?? (amount ? `${amountValue} ${currencyCode}` : null),
         payer: payer
           ? {
               payerEmail: payerEmail!,

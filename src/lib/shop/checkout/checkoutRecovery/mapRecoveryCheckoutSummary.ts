@@ -1,10 +1,21 @@
+import {
+  parseCanonicalOrderSnapshotFromLedger,
+  type CanonicalOrderSnapshotLedgerEnvelope,
+} from '@/lib/paypal/orderSnapshot/canonicalize';
+import type {
+  CanonicalOrderDestination,
+  CanonicalOrderSnapshot,
+} from '@/lib/paypal/orderSnapshot/types';
+import { reconcileCanonicalPayPalPaymentChain } from '@/lib/paypal/txLedger/canonicalPaymentReconciliation';
+
 type JsonRecord = Record<string, unknown>;
 
-type RecoveryLedgerRow = {
+type RecoveryLedgerRow = CanonicalOrderSnapshotLedgerEnvelope & {
   orderToken: string;
   status: string;
   cartSnapshot: unknown;
   shippingSnapshot: unknown;
+  authorizePayload: unknown;
   capturePayload: unknown;
   receiptLink: string | null;
   receiptFile: string | null;
@@ -62,7 +73,10 @@ function getCaptureAmount(capturePayload: unknown) {
   return null;
 }
 
-function formatMoney(amount: ReturnType<typeof getCaptureAmount>, fallbackCurrency?: string | null) {
+function formatMoney(
+  amount: ReturnType<typeof getCaptureAmount>,
+  fallbackCurrency?: string | null,
+) {
   if (!amount) return null;
 
   try {
@@ -98,13 +112,33 @@ function getCartSummary(cartSnapshot: unknown) {
   };
 }
 
-function getShippingSummary(shippingSnapshot: unknown) {
-  const shipping = asRecord(shippingSnapshot);
-  if (!shipping) return null;
+function getCanonicalOrderSummary(snapshot: CanonicalOrderSnapshot) {
+  const itemCount = snapshot.lines.reduce((total, line) => total + line.quantity, 0);
+  const itemTitles = snapshot.lines.slice(0, 2).map((line) => line.title);
 
-  const city = asString(shipping.shipping_city);
-  const state = asString(shipping.shipping_state);
-  const country = asString(shipping.shipping_country);
+  return {
+    itemCount,
+    itemTitles,
+    label:
+      itemTitles.length > 0
+        ? `${itemTitles.join(', ')}${snapshot.lines.length > itemTitles.length ? ` +${snapshot.lines.length - itemTitles.length} more` : ''}`
+        : null,
+  };
+}
+
+function getShippingSummary(
+  shippingSnapshot: unknown,
+  canonicalDestination?: CanonicalOrderDestination,
+) {
+  const shipping = asRecord(shippingSnapshot);
+
+  const city = asString(shipping?.shipping_city);
+  const state = canonicalDestination
+    ? canonicalDestination.region
+    : asString(shipping?.shipping_state);
+  const country = canonicalDestination
+    ? canonicalDestination.countryIso3
+    : asString(shipping?.shipping_country);
   const parts = [city, state, country].filter(Boolean);
 
   return parts.length ? parts.join(', ') : null;
@@ -131,8 +165,26 @@ function formatPlacedAt(date: Date) {
 }
 
 export function mapRecoveryCheckoutSummary(row: RecoveryLedgerRow) {
+  let canonicalSnapshot: CanonicalOrderSnapshot | null = null;
+  let canonicalEnvelopeInvalid = false;
+  try {
+    canonicalSnapshot = parseCanonicalOrderSnapshotFromLedger(row).snapshot;
+  } catch {
+    // A customer can still receive a support reference and actual PayPal capture amount, but
+    // corrupt canonical metadata must never revive mutable cart/address values as order truth.
+    canonicalEnvelopeInvalid = true;
+  }
   const captureAmount = getCaptureAmount(row.capturePayload);
-  const cartSummary = getCartSummary(row.cartSnapshot);
+  const canonicalPaymentChain = reconcileCanonicalPayPalPaymentChain(
+    row,
+    row.authorizePayload,
+    row.capturePayload,
+  );
+  const cartSummary = canonicalEnvelopeInvalid
+    ? { itemCount: 0, itemTitles: [], label: null }
+    : canonicalSnapshot
+      ? getCanonicalOrderSummary(canonicalSnapshot)
+      : getCartSummary(row.cartSnapshot);
 
   return {
     orderToken: row.orderToken,
@@ -146,13 +198,18 @@ export function mapRecoveryCheckoutSummary(row: RecoveryLedgerRow) {
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     placedAtLabel: formatPlacedAt(row.createdAt),
+    // This label describes money PayPal actually captured. The canonical total remains the
+    // expected order value and must never be presented as paid when the two disagree.
     paidAmountLabel: formatMoney(captureAmount),
     itemCount: cartSummary.itemCount,
     itemSummaryLabel: cartSummary.label,
     itemTitles: cartSummary.itemTitles,
-    shippingSummaryLabel: getShippingSummary(row.shippingSnapshot),
-    message:
-      row.lastErrorMessage || row.status === 'error'
+    shippingSummaryLabel: canonicalEnvelopeInvalid
+      ? null
+      : getShippingSummary(row.shippingSnapshot, canonicalSnapshot?.destination),
+    message: !canonicalPaymentChain.ok
+      ? 'Your payment was received, but its amount requires review before fulfillment.'
+      : row.lastErrorMessage || row.status === 'error'
         ? 'Your payment was received, but fulfillment needs review.'
         : 'Your payment was received and is still being processed.',
   };

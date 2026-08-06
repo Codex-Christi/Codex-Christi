@@ -1,3 +1,5 @@
+import type { CanonicalOrderSnapshotLedgerEnvelope } from '@/lib/paypal/orderSnapshot/canonicalize';
+
 export type JsonRecord = Record<string, unknown>;
 
 export type MerchizeOrderLookupResponse = {
@@ -41,7 +43,7 @@ export type MerchizeExternalOrderInvoiceResponse = {
   data?: MerchizeExternalOrderInvoiceRow[] | null;
 };
 
-export type MerchizeFulfillmentRegistrationInput = {
+export type MerchizeFulfillmentRegistrationInput = CanonicalOrderSnapshotLedgerEnvelope & {
   orderToken: string;
   paypalOrderId: string | null;
   djangoOrderIntentUuid: string | null;

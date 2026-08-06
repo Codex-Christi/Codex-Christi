@@ -46,6 +46,7 @@ import {
 import { isAcceptedDjangoFulfillmentProcessResponse } from '@/lib/paypal/txLedger/fulfillmentProcessResponse';
 import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
 import { getPayPalCaptureCompletion } from '@/lib/paypal/txLedger/captureCompletion';
+import { reconcileCanonicalPayPalPaymentChain } from '@/lib/paypal/txLedger/canonicalPaymentReconciliation';
 import { refreshPaidOrderRecoveryProjectionSafely } from '@/lib/paypal/txLedger/paidOrderRecoveryProjection';
 import { getMerchizeFulfillmentRetryEligibility } from '@/lib/paypal/txLedger/fulfillmentRetryPolicy';
 import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
@@ -530,6 +531,23 @@ export async function runPaidFulfillmentProcessing(
       throw new Error(captureCompletion.reason);
     }
 
+    // Final defense shared by capture-route, webhook, scanner, reconciliation, and admin triggers.
+    // New rows must have an intact envelope and an exact captured amount/currency; all-null rows
+    // remain on the legacy path. This runs before either full or fulfillment-only side effects.
+    const canonicalPayment = reconcileCanonicalPayPalPaymentChain(
+      row,
+      authData,
+      finalCapturedOrder,
+    );
+    if (!canonicalPayment.ok) {
+      throw new PaidFulfillmentProcessingError({
+        code: canonicalPayment.reconciliation.errorCode,
+        message: canonicalPayment.reconciliation.reason,
+        stage: 'capture_validation',
+      });
+    }
+    const canonicalOrderSnapshot = canonicalPayment.snapshot;
+
     if (options.executionScope === 'merchize_fulfillment_only') {
       const acceptedDjangoHandoff = isAcceptedDjangoFulfillmentProcessResponse(
         row.merchizeFulfillmentResponsePayload,
@@ -574,7 +592,8 @@ export async function runPaidFulfillmentProcessing(
       const receiptRes = await savePaymentReceiptToCloud(
         buildPaymentReceiptPayload({
           authData,
-          cart: row.cartSnapshot as CartVariant[],
+          cart: canonicalOrderSnapshot ? undefined : (row.cartSnapshot as CartVariant[]),
+          canonicalOrderSnapshot,
           customer,
           ORD_string,
           shippingAddressOverride:
@@ -618,6 +637,7 @@ export async function runPaidFulfillmentProcessing(
           country_iso2: row.countryIso2 ?? 'US',
           pdfReceiptLink: row.receiptLink ?? '',
           receiptFileName: row.receiptFile ?? '',
+          canonicalOrderSnapshot,
         }),
       );
 
@@ -665,9 +685,10 @@ export async function runPaidFulfillmentProcessing(
       activeStage = 'django_fulfillment_handoff';
       const fulfillmentSend = await sendMerchizeFulfillmentOrder({
         cartSnapshot: row.cartSnapshot as CartVariant[],
+        canonicalOrderSnapshot,
         djangoPaymentSaveCustomId: row.djangoPaymentSaveCustomId,
         identifier: CODEX_CHRISTI_FULFILLMENT_IDENTIFIER,
-        currency: row.initialCurrency ?? 'USD',
+        currency: canonicalOrderSnapshot?.currency ?? row.initialCurrency ?? 'USD',
         customerName: row.customerName,
         countryIso2: row.countryIso2,
         fulfillmentAddress,
@@ -717,6 +738,9 @@ export async function runPaidFulfillmentProcessing(
         customerEmail: row.customerEmail,
         shippingSnapshot: fulfillmentAddress,
         cartSnapshot: row.cartSnapshot,
+        canonicalOrderSnapshot: row.canonicalOrderSnapshot,
+        canonicalOrderSnapshotVersion: row.canonicalOrderSnapshotVersion,
+        canonicalOrderSnapshotHash: row.canonicalOrderSnapshotHash,
       });
 
       activeStage = 'merchize_order_sync';

@@ -3,6 +3,9 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import { OrderResponseBody } from '@paypal/paypal-js';
 import type { CartVariant } from '@/stores/shop_stores/cartStore';
+import type { CanonicalOrderSnapshot } from '@/lib/paypal/orderSnapshot/types';
+import { parseCanonicalOrderSnapshot } from '@/lib/paypal/orderSnapshot/canonicalize';
+import { getCanonicalInvoicePricing } from '@/lib/paypal/orderSnapshot/consumerData';
 
 type InvoiceLineItem = {
   name: string;
@@ -12,6 +15,7 @@ type InvoiceLineItem = {
     value: string;
     currencyCode: string;
   };
+  lineAmount?: string;
 };
 
 type InvoiceShippingAddressOverride = {
@@ -119,8 +123,15 @@ export const createPaypalShopInvoicePDF = async (
   authData: OrderResponseBody,
   cart?: CartVariant[],
   shippingAddressOverride?: InvoiceShippingAddressOverride | null,
+  canonicalOrderSnapshot?: CanonicalOrderSnapshot | null,
 ) => {
   ensureHelveticaAFM();
+
+  // A canonical receipt never mixes its lines or totals with mutable PayPal/browser data.
+  // Parsing here gives this direct consumer its own integrity check in addition to the ledger gate.
+  const canonicalPricing = canonicalOrderSnapshot
+    ? getCanonicalInvoicePricing(parseCanonicalOrderSnapshot(canonicalOrderSnapshot))
+    : null;
 
   // Generate PDF
   const pdfBuffer = await new Promise<Buffer>((resolve, reject) => {
@@ -220,11 +231,13 @@ export const createPaypalShopInvoicePDF = async (
         .moveDown(1);
     }
 
-    // PayPal does not always echo item-level lines on authorization/capture payloads.
-    // Use the persisted ledger cart snapshot as the fallback so receipts remain itemized.
-    const currencyCode = getCurrencyCodeFromPurchaseUnit(purchaseUnit);
-    const paypalItems = getPaypalLineItems(purchaseUnit);
-    const items = paypalItems.length ? paypalItems : getCartLineItems(cart, currencyCode);
+    // Legacy rows retain their PayPal/cart fallback. New rows render only the sealed snapshot.
+    const currencyCode =
+      canonicalPricing?.currencyCode ?? getCurrencyCodeFromPurchaseUnit(purchaseUnit);
+    const paypalItems = canonicalPricing ? [] : getPaypalLineItems(purchaseUnit);
+    const items: InvoiceLineItem[] =
+      canonicalPricing?.items ??
+      (paypalItems.length ? paypalItems : getCartLineItems(cart, currencyCode));
     const startY = 270;
 
     // Table header
@@ -246,16 +259,20 @@ export const createPaypalShopInvoicePDF = async (
       const unitAmount = item.unitAmount;
       const itemCurrencyCode = unitAmount.currencyCode || currencyCode;
       const quantity = parseInt(item.quantity || '0');
-      const price = parseFloat(unitAmount?.value || '0');
-      const total = quantity * price;
+      const priceText = canonicalPricing
+        ? unitAmount.value
+        : parseFloat(unitAmount?.value || '0').toFixed(2);
+      const totalText = canonicalPricing
+        ? (item.lineAmount ?? '0')
+        : (quantity * parseFloat(unitAmount?.value || '0')).toFixed(2);
 
       doc
         .fillColor('#333')
         .text(item.name || '', 50, y, { width: 145, lineBreak: true })
         .text(item.sku || '', 210, y, { width: 150, lineBreak: true })
         .text(quantity.toString(), 350, y, { width: 50, align: 'right' })
-        .text(`${price.toFixed(2)} ${itemCurrencyCode}`, 400, y, { width: 70, align: 'right' })
-        .text(`${total.toFixed(2)} ${itemCurrencyCode}`, 470, y, { width: 80, align: 'right' });
+        .text(`${priceText} ${itemCurrencyCode}`, 400, y, { width: 70, align: 'right' })
+        .text(`${totalText} ${itemCurrencyCode}`, 470, y, { width: 80, align: 'right' });
 
       y += 30;
     });
@@ -273,24 +290,31 @@ export const createPaypalShopInvoicePDF = async (
         };
       };
     } | null)?.amount;
-    if (amount) {
-      const currencyCode = amount.currencyCode ?? amount.currency_code ?? '';
-      const breakdown = amount.breakdown;
-      const subtotal = parseFloat(breakdown?.itemTotal?.value ?? breakdown?.item_total?.value ?? '0');
-      const shippingCost = parseFloat(breakdown?.shipping?.value || '0');
-      const total = parseFloat(amount.value || '0');
+    if (amount || canonicalPricing) {
+      const summaryCurrencyCode =
+        canonicalPricing?.currencyCode ?? amount?.currencyCode ?? amount?.currency_code ?? '';
+      const breakdown = amount?.breakdown;
+      const subtotalText =
+        canonicalPricing?.subtotal ??
+        parseFloat(
+          breakdown?.itemTotal?.value ?? breakdown?.item_total?.value ?? '0',
+        ).toFixed(2);
+      const shippingText =
+        canonicalPricing?.shipping ?? parseFloat(breakdown?.shipping?.value || '0').toFixed(2);
+      const totalText =
+        canonicalPricing?.total ?? parseFloat(amount?.value || '0').toFixed(2);
 
       doc
         .moveTo(400, y + 20)
         .lineTo(550, y + 20)
         .stroke()
         .text('Subtotal:', 400, y + 30, { width: 70, align: 'right' })
-        .text(`${subtotal.toFixed(2)} ${currencyCode}`, 470, y + 30, {
+        .text(`${subtotalText} ${summaryCurrencyCode}`, 470, y + 30, {
           width: 80,
           align: 'right',
         })
         .text('Shipping:', 400, y + 50, { width: 70, align: 'right' })
-        .text(`${shippingCost.toFixed(2)} ${currencyCode}`, 470, y + 50, {
+        .text(`${shippingText} ${summaryCurrencyCode}`, 470, y + 50, {
           width: 80,
           align: 'right',
         })
@@ -299,7 +323,10 @@ export const createPaypalShopInvoicePDF = async (
         .stroke()
         .font('Helvetica-Bold')
         .text('Total:', 400, y + 80, { width: 70, align: 'right' })
-        .text(`${total.toFixed(2)} ${currencyCode}`, 470, y + 80, { width: 80, align: 'right' })
+        .text(`${totalText} ${summaryCurrencyCode}`, 470, y + 80, {
+          width: 80,
+          align: 'right',
+        })
         .font('Helvetica');
     }
 

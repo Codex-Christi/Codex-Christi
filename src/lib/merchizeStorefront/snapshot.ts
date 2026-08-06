@@ -163,8 +163,17 @@ function toBasicProductData(snapshot: {
   image: string | null;
   retailPrice: number | null;
   variantsJson?: Prisma.JsonValue | null;
+  rawProductJson?: Prisma.JsonValue | null;
 }): BasicProductData {
+  const rawProduct =
+    snapshot.rawProductJson &&
+    typeof snapshot.rawProductJson === 'object' &&
+    !Array.isArray(snapshot.rawProductJson)
+      ? snapshot.rawProductJson
+      : {};
+
   return {
+    ...rawProduct,
     _id: snapshot.merchizeProductId,
     title: snapshot.title ?? 'Product',
     description: snapshot.description ?? '',

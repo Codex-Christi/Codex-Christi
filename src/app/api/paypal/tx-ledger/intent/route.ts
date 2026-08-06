@@ -2,14 +2,47 @@ import { randomUUID } from 'crypto';
 import type { Order } from '@paypal/paypal-server-sdk';
 import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
 import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
-import {
-  CheckoutLivePricingUnavailableError,
-  createPayPalOrder,
-} from '@/lib/paypal/createPayPalOrder';
+import { createPayPalOrder } from '@/lib/paypal/createPayPalOrder';
 import { paypalRouteError, paypalRouteSuccess } from '@/lib/paypal/txLedger/routeResponses';
 import { getServerSessionState } from '@/lib/session/server-session';
 import { refreshPaidOrderRecoveryProjectionSafely } from '@/lib/paypal/txLedger/paidOrderRecoveryProjection';
 import { getCheckoutSurfaceProvenance } from '@/lib/paypal/txLedger/checkoutSurfaceProvenance';
+import {
+  CanonicalOrderResolutionError,
+} from '@/lib/paypal/orderSnapshot/resolver';
+import type { CanonicalOrderResolutionInput } from '@/lib/paypal/orderSnapshot/types';
+import { resolveCanonicalOrderSnapshotFromMerchize } from '@/lib/paypal/orderSnapshot/merchizeResolver';
+import { getCountrySupport } from '@/lib/datasetSearchers/shippingSupportMerchize';
+import { normalizeCountryToIso3 } from '@/lib/utils/shop/checkout/normalizeCountryToIso3';
+import type { ShopCheckoutStoreInterface } from '@/stores/shop_stores/checkoutStore';
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function hasRequiredDeliveryAddress(
+  value: unknown,
+): value is ShopCheckoutStoreInterface['delivery_address'] {
+  const address = asRecord(value);
+  return Boolean(
+    address &&
+      nonEmptyString(address.shipping_address_line_1) &&
+      nonEmptyString(address.shipping_city) &&
+      nonEmptyString(address.shipping_state) &&
+      nonEmptyString(address.shipping_country) &&
+      nonEmptyString(address.zip_code),
+  );
+}
+
+function toLedgerJson(value: unknown) {
+  return JSON.parse(JSON.stringify(value));
+}
 
 export async function POST(req: Request) {
   const requestId = randomUUID();
@@ -51,15 +84,24 @@ export async function POST(req: Request) {
     logRouteError(stage, code, err);
 
     if (persistToLedger && orderToken) {
-      await paypalTxLedger.paypalIntent.update({
-        where: { orderToken },
-        data: {
-          status: PAYPAL_LEDGER_STATUS.ERROR,
-          lastErrorCode: code,
-          lastErrorMessage: err instanceof Error ? err.message : String(err),
-        },
-      });
-      await refreshPaidOrderRecoveryProjectionSafely(orderToken);
+      try {
+        await paypalTxLedger.paypalIntent.update({
+          where: { orderToken },
+          data: {
+            status: PAYPAL_LEDGER_STATUS.ERROR,
+            lastErrorCode: code,
+            lastErrorMessage: err instanceof Error ? err.message : String(err),
+          },
+        });
+        await refreshPaidOrderRecoveryProjectionSafely(orderToken);
+      } catch (ledgerError) {
+        console.error('[paypal.intent.persist_error_failed]', {
+          requestId,
+          orderToken,
+          code,
+          error: ledgerError instanceof Error ? ledgerError.message : String(ledgerError),
+        });
+      }
     }
 
     return paypalRouteError({
@@ -73,31 +115,81 @@ export async function POST(req: Request) {
   };
 
   try {
-    const body = await req.json();
+    const body = asRecord(await req.json());
+    if (!body) {
+      return validationError('INVALID_REQUEST', 'A checkout request object is required.');
+    }
     const checkoutSurface = getCheckoutSurfaceProvenance(req);
     const {
-      cart,
+      selections,
       customer,
-      country,
-      country_iso_3,
-      initialCurrency,
       delivery_address,
       djangoOrderIntentUuid,
       djangoOrderIntentOrderId,
       djangoOrderIntentPayload,
       djangoOrderIntentVerifyPayload,
     } = body;
+    const customerRecord = asRecord(customer);
     const sessionState = await getServerSessionState();
     const authenticatedUserId = sessionState.isAuthenticated ? sessionState.userID : null;
 
-    if (!Array.isArray(cart) || cart.length === 0) {
+    if (!Array.isArray(selections) || selections.length === 0) {
       return validationError('INVALID_CART', 'Cart required');
     }
-    if (!customer?.name || !customer?.email) {
+    if (!nonEmptyString(customerRecord?.name) || !nonEmptyString(customerRecord?.email)) {
       return validationError('INVALID_CUSTOMER', 'Customer required');
     }
-    if (!delivery_address) {
+    if (!hasRequiredDeliveryAddress(delivery_address)) {
       return validationError('INVALID_DELIVERY_ADDRESS', 'Delivery address required');
+    }
+
+    const countryIso3 = normalizeCountryToIso3(delivery_address.shipping_country);
+    if (!countryIso3) {
+      return validationError(
+        'INVALID_DESTINATION',
+        'The selected shipping country could not be resolved.',
+      );
+    }
+
+    // Resolve the ISO-2 address code from the same server country catalog used by checkout. This
+    // validates consistency without introducing a new destination-eligibility policy (P0.3).
+    const countrySupport = await getCountrySupport(countryIso3, 'merchize');
+    if (!countrySupport.country?.country_iso2) {
+      return validationError(
+        'INVALID_DESTINATION',
+        'The selected shipping country could not be resolved.',
+      );
+    }
+
+    let canonicalOrderSnapshot;
+    try {
+      canonicalOrderSnapshot = await resolveCanonicalOrderSnapshotFromMerchize({
+        selections: selections as CanonicalOrderResolutionInput['selections'],
+        destination: {
+          countryIso3,
+          region: delivery_address.shipping_state,
+        },
+      });
+    } catch (resolutionError) {
+      if (resolutionError instanceof CanonicalOrderResolutionError) {
+        return fail({
+          code: resolutionError.code,
+          stage: 'resolve_canonical_order_snapshot',
+          message: resolutionError.message,
+          err: resolutionError,
+          status: resolutionError.status,
+          persistToLedger: false,
+        });
+      }
+
+      return fail({
+        code: 'ORDER_SNAPSHOT_RESOLUTION_FAILED',
+        stage: 'resolve_canonical_order_snapshot',
+        message: 'Checkout pricing or shipping could not be verified. Please try again.',
+        err: resolutionError,
+        status: 503,
+        persistToLedger: false,
+      });
     }
 
     orderToken = randomUUID();
@@ -106,18 +198,30 @@ export async function POST(req: Request) {
       data: {
         orderToken,
         status: PAYPAL_LEDGER_STATUS.INTENT_CREATING,
-        customerName: customer.name,
-        customerEmail: customer.email,
+        customerName: customerRecord.name.trim(),
+        customerEmail: customerRecord.email.trim(),
         userId: authenticatedUserId,
-        djangoOrderIntentUuid: djangoOrderIntentUuid ?? null,
-        djangoOrderIntentOrderId: djangoOrderIntentOrderId ?? null,
-        djangoOrderIntentPayload: djangoOrderIntentPayload ?? null,
-        djangoOrderIntentVerifyPayload: djangoOrderIntentVerifyPayload ?? null,
-        countryIso2: country ?? null,
-        countryIso3: country_iso_3 ?? null,
-        initialCurrency: initialCurrency ?? null,
-        cartSnapshot: cart,
+        djangoOrderIntentUuid: nonEmptyString(djangoOrderIntentUuid)
+          ? djangoOrderIntentUuid.trim()
+          : null,
+        djangoOrderIntentOrderId: nonEmptyString(djangoOrderIntentOrderId)
+          ? djangoOrderIntentOrderId.trim()
+          : null,
+        djangoOrderIntentPayload:
+          djangoOrderIntentPayload == null ? undefined : toLedgerJson(djangoOrderIntentPayload),
+        djangoOrderIntentVerifyPayload:
+          djangoOrderIntentVerifyPayload == null
+            ? undefined
+            : toLedgerJson(djangoOrderIntentVerifyPayload),
+        countryIso2: countrySupport.country.country_iso2,
+        countryIso3,
+        initialCurrency: canonicalOrderSnapshot.currency,
+        // Required legacy column; new consumers use the sealed canonical snapshot instead.
+        cartSnapshot: toLedgerJson(selections),
         shippingSnapshot: delivery_address,
+        canonicalOrderSnapshot: toLedgerJson(canonicalOrderSnapshot),
+        canonicalOrderSnapshotVersion: canonicalOrderSnapshot.version,
+        canonicalOrderSnapshotHash: canonicalOrderSnapshot.hash,
         ...checkoutSurface,
       },
     });
@@ -127,24 +231,15 @@ export async function POST(req: Request) {
     try {
       paypalOrder = await createPayPalOrder({
         orderToken,
-        cart,
-        customer,
-        country,
-        country_iso_3,
-        initialCurrency,
+        canonicalOrderSnapshot,
+        customer: {
+          name: customerRecord.name.trim(),
+          email: customerRecord.email.trim(),
+        },
+        country: countrySupport.country.country_iso2,
         delivery_address,
       });
     } catch (createErr) {
-      if (createErr instanceof CheckoutLivePricingUnavailableError) {
-        return fail({
-          code: createErr.code,
-          stage: 'verify_live_pricing',
-          message: createErr.message,
-          err: createErr,
-          status: createErr.status,
-        });
-      }
-
       return fail({
         code: 'CREATE_ORDER_FAILED',
         stage: 'create_paypal_order',

@@ -1,11 +1,10 @@
 import errorToast from '@/lib/error-toast';
 import MyPaypalButtons from './MyPaypalButtons';
 import MyPayPalCardFields from './MyPaypalCardFields';
-import { FC, useCallback, useContext } from 'react';
+import { FC, useCallback } from 'react';
 import { Loader2, ShieldCheck } from 'lucide-react';
 import { CheckoutOptions } from '../PaymentSection';
 import { useCartStore } from '@/stores/shop_stores/cartStore';
-import { ServerOrderDetailsContext } from '../ServerOrderDetailsComponent';
 import { useShopCheckoutStore } from '@/stores/shop_stores/checkoutStore';
 import { usePayPalTXApproveCallback } from '@/lib/hooks/shopHooks/checkout/usePayPalTXApproveCallback';
 import { usePayPalIntentStore } from '@/stores/shop_stores/checkoutStore/paypalIntentStore';
@@ -18,7 +17,6 @@ const PayPalCheckoutChildren: FC<{ mode: CheckoutOptions }> = (props) => {
 
   // Hooks
   const cart = useCartStore((store) => store.variants);
-  const serverOrderDetails = useContext(ServerOrderDetailsContext);
   const { first_name, last_name, email, delivery_address } = useShopCheckoutStore();
   const { isFinalizingPayment, mainPayPalApproveCallback } = usePayPalTXApproveCallback();
   const setIntent = usePayPalIntentStore((store) => store.setIntent);
@@ -29,10 +27,6 @@ const PayPalCheckoutChildren: FC<{ mode: CheckoutOptions }> = (props) => {
     djangoOrderIntentPayload,
     djangoOrderIntentVerifyPayload,
   } = useDjangoOrderIntentStore();
-
-  // Destructuring
-  const { countrySupport } = serverOrderDetails || {};
-  const { country_iso2, currency, country_iso3 } = countrySupport?.country || {};
 
   // Create order async function
   const createOrder = useCallback(async (): Promise<string> => {
@@ -52,29 +46,24 @@ const PayPalCheckoutChildren: FC<{ mode: CheckoutOptions }> = (props) => {
             requestId: string;
             orderToken?: string;
           };
-        };
+    };
 
     try {
-      console.log('[paypal-ledger.intent.request]', {
-        djangoOrderIntentUuid,
-        djangoOrderIntentOrderId,
-        customerEmail: email,
-        delivery_address,
-        cartItemCount: cart.length,
-      });
-
       const response = await fetch('/next-api/paypal/tx-ledger/intent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          cart,
+          // Product/variant IDs are selectors only. The server resolves every descriptive and
+          // monetary field again before creating the PayPal order.
+          selections: cart.map((item) => ({
+            productId: item.itemDetail.product,
+            variantId: item.variantId,
+            quantity: item.quantity,
+          })),
           customer: {
             name: `${first_name} ${last_name}`,
-            email: email ?? 'john@example.com',
+            email: email ?? '',
           },
-          country: country_iso2 ?? 'US',
-          country_iso_3: country_iso3 ?? 'USA',
-          initialCurrency: currency ?? 'USD',
           delivery_address,
           djangoOrderIntentUuid,
           djangoOrderIntentOrderId,
@@ -98,8 +87,8 @@ const PayPalCheckoutChildren: FC<{ mode: CheckoutOptions }> = (props) => {
 
         const error = new Error(routeError.message ?? 'Failed to create PayPal intent');
         error.name =
-          routeError.code === 'LIVE_PRICING_UNAVAILABLE'
-            ? 'CheckoutLivePricingUnavailableError'
+          routeError.stage === 'resolve_canonical_order_snapshot'
+            ? 'CanonicalOrderResolutionError'
             : 'PayPalIntentError';
         throw error;
       }
@@ -112,13 +101,11 @@ const PayPalCheckoutChildren: FC<{ mode: CheckoutOptions }> = (props) => {
 
       return payload.data.paypalOrderId;
     } catch (err: unknown) {
-      console.log(err);
-
-      const isLivePricingUnavailable =
-        err instanceof Error && err.name === 'CheckoutLivePricingUnavailableError';
+      const isOrderResolutionUnavailable =
+        err instanceof Error && err.name === 'CanonicalOrderResolutionError';
 
       errorToast({
-        header: isLivePricingUnavailable
+        header: isOrderResolutionUnavailable
           ? 'Checkout temporarily unavailable'
           : 'Payment setup failed',
         message: err instanceof Error ? err.message : String(err),
@@ -127,9 +114,6 @@ const PayPalCheckoutChildren: FC<{ mode: CheckoutOptions }> = (props) => {
     }
   }, [
     cart,
-    country_iso2,
-    country_iso3,
-    currency,
     delivery_address,
     email,
     first_name,

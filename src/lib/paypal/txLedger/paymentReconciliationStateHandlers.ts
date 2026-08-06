@@ -5,15 +5,6 @@ import {
   enqueueAdminPaymentReconciliationNotification,
   sendPendingAdminRecoveryNotificationsForOrder,
 } from '@/lib/paypal/txLedger/adminNotificationOutbox';
-import { getPayPalCaptureCompletion } from '@/lib/paypal/txLedger/captureCompletion';
-import {
-  asRecord,
-  asString,
-  getProcessingAuthorizePayload,
-  getRelatedAuthorizationId,
-  getRelatedOrderId,
-  safeJson,
-} from '@/lib/paypal/txLedger/paymentReconciliationEvidence';
 import type {
   PaymentLedgerRow,
   PayPalPaymentReconciliationResult,
@@ -23,6 +14,13 @@ import { runPaidFulfillmentProcessing } from '@/lib/paypal/txLedger/runPaidFulfi
 import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
 import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
 import type { Prisma } from '@/lib/prisma/shop/paypal/txLedger/generated/paypalTxLedger/client';
+import {
+  buildReconciledAuthorizationLedgerDecision,
+  buildReconciledCaptureLedgerDecision,
+  buildMissingPaymentReferenceLedgerDecision,
+  type PaymentReconciliationLedgerDecision,
+} from '@/lib/paypal/txLedger/paymentReconciliationLedgerTransitions';
+import { commitOptimisticLedgerTransition } from '@/lib/paypal/txLedger/optimisticLedgerTransition';
 
 const { CRITICAL, WARNING } = ADMIN_NOTIFICATION_SEVERITY;
 
@@ -58,14 +56,8 @@ function result({
   };
 }
 
-async function updateLedger(row: PaymentLedgerRow, data: Prisma.PaypalIntentUpdateInput) {
-  await paypalTxLedger.paypalIntent.update({ where: { orderToken: row.orderToken }, data });
-  await refreshPaidOrderRecoveryProjectionSafely(row.orderToken);
-}
-
-async function attention({
+async function notifyAttention({
   row,
-  data,
   errorCode,
   message,
   issueSummary,
@@ -73,14 +65,12 @@ async function attention({
   resultArgs,
 }: {
   row: PaymentLedgerRow;
-  data: Prisma.PaypalIntentUpdateInput;
   errorCode: string;
   message: string;
   issueSummary: string[];
   severity: typeof CRITICAL | typeof WARNING;
   resultArgs: Omit<ResultArgs, 'row' | 'message' | 'notificationCreated'>;
 }) {
-  await updateLedger(row, data);
   const notification = await enqueueAdminPaymentReconciliationNotification({
     orderToken: row.orderToken,
     paypalOrderId: row.paypalOrderId,
@@ -102,41 +92,45 @@ async function attention({
   return result({ row, message, ...resultArgs, notificationCreated: notification.created });
 }
 
-function statusForIncompleteCapture(status: string | null) {
-  if (status === 'PENDING') return PAYPAL_LEDGER_STATUS.PENDING;
-  if (status === 'REFUNDED' || status === 'PARTIALLY_REFUNDED') {
-    return PAYPAL_LEDGER_STATUS.REFUNDED;
-  }
-  return PAYPAL_LEDGER_STATUS.ERROR;
+async function commitReconciliationDecision(
+  {
+    row,
+    build,
+  }: {
+  row: PaymentLedgerRow;
+  build: (latest: PaymentLedgerRow) => PaymentReconciliationLedgerDecision;
+}) {
+  const committed = await commitOptimisticLedgerTransition({
+    load: () => paypalTxLedger.paypalIntent.findUnique({ where: { orderToken: row.orderToken } }),
+    build,
+    commit: async (latest, decision) => {
+      const updated = await paypalTxLedger.paypalIntent.updateMany({
+        where: {
+          orderToken: row.orderToken,
+          status: latest.status,
+          updatedAt: latest.updatedAt,
+        },
+        data: decision.data as Prisma.PaypalIntentUpdateManyMutationInput,
+      });
+      return updated.count === 1;
+    },
+  });
+  await refreshPaidOrderRecoveryProjectionSafely(row.orderToken);
+  return committed;
 }
 
-function captureLinkedData({
-  row,
-  payload,
-  orderPayload,
-  authorizationPayload,
-  authorizePayload,
-}: {
-  row: PaymentLedgerRow;
-  payload: unknown;
-  orderPayload?: unknown;
-  authorizationPayload?: unknown;
-  authorizePayload?: unknown;
-}) {
-  const paypalOrderId =
-    row.paypalOrderId ?? getRelatedOrderId(payload) ?? getRelatedOrderId(orderPayload);
-  const paypalAuthorizationId =
-    getRelatedAuthorizationId(payload) ??
-    getRelatedAuthorizationId(orderPayload) ??
-    getRelatedAuthorizationId(authorizationPayload) ??
-    row.paypalAuthorizationId;
-
+function decisionResultArgs(decision: PaymentReconciliationLedgerDecision) {
   return {
-    ...(paypalOrderId ? { paypalOrderId } : {}),
-    ...(paypalAuthorizationId ? { paypalAuthorizationId } : {}),
-    ...(authorizePayload ? { authorizePayload: safeJson(authorizePayload) } : {}),
-    capturePayload: safeJson(payload),
-  } satisfies Prisma.PaypalIntentUpdateInput;
+    ok: decision.ok,
+    action: decision.action,
+    status: decision.status,
+    captureId: decision.captureId,
+    authorizationStatus: decision.authorizationStatus,
+  };
+}
+
+function decisionSeverity(decision: PaymentReconciliationLedgerDecision) {
+  return decision.severity === 'warning' ? WARNING : CRITICAL;
 }
 
 export async function handleReconciledCapture({
@@ -150,121 +144,57 @@ export async function handleReconciledCapture({
   orderPayload?: unknown;
   authorizationPayload?: unknown;
 }) {
-  const completion = getPayPalCaptureCompletion(payload);
-  const authorizePayload = getProcessingAuthorizePayload({
+  const committed = await commitReconciliationDecision({
     row,
-    orderPayload,
-    paymentPayload: payload,
-    authorizationPayload,
+    build: (latest) =>
+      buildReconciledCaptureLedgerDecision({
+        row: latest,
+        payload,
+        orderPayload,
+        authorizationPayload,
+      }),
   });
-  const baseData = captureLinkedData({
-    row,
-    payload,
-    orderPayload,
-    authorizationPayload,
-    authorizePayload,
-  });
-
-  if (!completion.ok) {
-    const status = statusForIncompleteCapture(completion.status);
-    return attention({
-      row,
-      data: {
-        ...baseData,
-        status,
-        lastErrorCode: 'CAPTURE_NOT_COMPLETED',
-        lastErrorMessage: completion.reason,
-      },
-      errorCode: 'CAPTURE_NOT_COMPLETED',
-      message: completion.reason,
-      issueSummary: [
-        completion.reason,
-        'Fulfillment remains blocked until PayPal capture is completed.',
-      ],
-      severity: CRITICAL,
-      resultArgs: {
-        ok: false,
-        action: 'capture_checked_incomplete',
-        status,
-        captureId: completion.captureId,
-      },
+  const decision = committed.transition;
+  if (!decision.shouldNotify) {
+    return result({
+      row: committed.row,
+      message: decision.message,
+      ...decisionResultArgs(decision),
     });
   }
-
-  if (!authorizePayload) {
-    const message =
-      'PayPal capture is COMPLETED, but no PayPal order/customId payload is available for payment-save processing.';
-    return attention({
-      row,
-      data: {
-        ...baseData,
-        status: PAYPAL_LEDGER_STATUS.ERROR,
-        lastErrorCode: 'PAYPAL_CAPTURE_RECONCILED_AUTHORIZE_PAYLOAD_MISSING',
-        lastErrorMessage: message,
-      },
-      errorCode: 'PAYPAL_CAPTURE_RECONCILED_AUTHORIZE_PAYLOAD_MISSING',
-      message,
-      issueSummary: [
-        completion.reason,
-        message,
-        'Fulfillment remains blocked until PayPal order/customId evidence is restored.',
-      ],
-      severity: CRITICAL,
-      resultArgs: {
-        ok: false,
-        action: 'capture_reconciled_authorize_payload_missing',
-        status: PAYPAL_LEDGER_STATUS.ERROR,
-        captureId: completion.captureId,
-      },
-    });
-  }
-
-  const notification = await attention({
-    row,
-    data: {
-      ...baseData,
-      status: PAYPAL_LEDGER_STATUS.CAPTURED,
-      lastErrorCode: null,
-      lastErrorMessage: null,
-    },
-    errorCode: 'PAYPAL_CAPTURE_RECONCILED',
-    message: completion.reason,
-    issueSummary: [
-      completion.reason,
-      'Ledger capture payload was refreshed from PayPal.',
-      'Server-side fulfillment processing was resumed.',
-    ],
-    severity: WARNING,
-    resultArgs: {
-      ok: true,
-      action: 'capture_reconciled_and_fulfillment_resumed',
-      status: PAYPAL_LEDGER_STATUS.CAPTURED,
-      captureId: completion.captureId,
-    },
+  const notification = await notifyAttention({
+    row: committed.row,
+    errorCode: decision.errorCode,
+    message: decision.message,
+    issueSummary: decision.issueSummary,
+    severity: decisionSeverity(decision),
+    resultArgs: decisionResultArgs(decision),
   });
+
+  if (!decision.shouldResumeFulfillment) return notification;
 
   try {
-    await runPaidFulfillmentProcessing(row.orderToken, {
+    await runPaidFulfillmentProcessing(committed.row.orderToken, {
       triggerDetail: 'capture_reconciled_and_fulfillment_resumed',
       triggerSource: 'payment_reconciliation',
     });
     return result({
-      row,
+      row: committed.row,
       ok: true,
       action: 'capture_reconciled_and_fulfillment_resumed',
       status: PAYPAL_LEDGER_STATUS.CAPTURED,
-      message: completion.reason,
-      captureId: completion.captureId,
+      message: decision.message,
+      captureId: decision.captureId,
       notificationCreated: notification.notificationCreated,
     });
   } catch (error) {
     return result({
-      row,
+      row: committed.row,
       ok: false,
       action: 'capture_reconciled_fulfillment_failed',
       status: PAYPAL_LEDGER_STATUS.CAPTURED,
       message: error instanceof Error ? error.message : String(error),
-      captureId: completion.captureId,
+      captureId: decision.captureId,
       notificationCreated: notification.notificationCreated,
     });
   }
@@ -279,94 +209,54 @@ export async function handleReconciledAuthorization({
   payload: unknown;
   orderPayload?: unknown;
 }) {
-  const authorization = asRecord(payload);
-  const authorizationStatus = asString(authorization?.status)?.toUpperCase() ?? null;
-  const expirationTime = asString(authorization?.expirationTime);
-  const expiresAt = expirationTime ? new Date(expirationTime) : null;
-  const expired = Boolean(
-    expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt <= new Date(),
-  );
-  const isOpen = authorizationStatus === 'CREATED' && !expired;
-  const message = isOpen
-    ? expirationTime
-      ? `PayPal authorization is still open until ${expirationTime}. Manual capture or reauthorization review is required.`
-      : 'PayPal authorization is still open. Manual capture or reauthorization review is required.'
-    : authorizationStatus === 'CAPTURED'
-      ? 'PayPal reports the authorization as captured, but no completed capture payload is stored locally.'
-      : expired
-        ? `PayPal authorization expired at ${expirationTime}. A new authorized payment is required before fulfillment.`
-        : `PayPal authorization status is ${authorizationStatus ?? 'unknown'} and requires manual review.`;
-  const errorCode = isOpen
-    ? 'PAYPAL_AUTHORIZATION_STILL_OPEN'
-    : authorizationStatus === 'CAPTURED'
-      ? 'PAYPAL_AUTHORIZATION_CAPTURED_WITHOUT_CAPTURE_PAYLOAD'
-      : authorizationStatus === 'VOIDED'
-        ? 'PAYPAL_AUTHORIZATION_VOIDED'
-        : authorizationStatus === 'DENIED'
-          ? 'PAYPAL_AUTHORIZATION_DENIED'
-          : expired
-            ? 'PAYPAL_AUTHORIZATION_EXPIRED'
-            : 'PAYPAL_AUTHORIZATION_RECONCILIATION_REQUIRED';
-  const status = isOpen
-    ? PAYPAL_LEDGER_STATUS.AUTHORIZED
-    : authorizationStatus === 'PENDING'
-      ? PAYPAL_LEDGER_STATUS.PENDING
-      : PAYPAL_LEDGER_STATUS.ERROR;
-  const paypalOrderId =
-    row.paypalOrderId ?? getRelatedOrderId(payload) ?? getRelatedOrderId(orderPayload);
-
-  return attention({
+  const now = new Date();
+  const committed = await commitReconciliationDecision({
     row,
-    data: {
-      ...(paypalOrderId ? { paypalOrderId } : {}),
-      paypalAuthorizationId: asString(authorization?.id) ?? row.paypalAuthorizationId,
-      authorizePayload: safeJson(
-        getProcessingAuthorizePayload({ row, orderPayload, authorizationPayload: payload }) ??
-          payload,
-      ),
-      status,
-      lastErrorCode: errorCode,
-      lastErrorMessage: message,
-    },
-    errorCode,
-    message,
-    issueSummary: isOpen
-      ? [
-          message,
-          'The reconciliation scanner does not auto-capture authorizations.',
-          'Review PayPal first, then decide whether manual capture or a new customer checkout is appropriate.',
-        ]
-      : [message, 'Fulfillment remains blocked until the PayPal payment state is resolved.'],
-    severity: isOpen ? WARNING : CRITICAL,
-    resultArgs: {
-      ok: false,
-      action: isOpen ? 'authorization_checked_open' : 'authorization_checked_attention_required',
-      status,
-      authorizationStatus,
-    },
+    build: (latest) =>
+      buildReconciledAuthorizationLedgerDecision({
+        row: latest,
+        payload,
+        orderPayload,
+        now,
+      }),
+  });
+  const decision = committed.transition;
+  if (!decision.shouldNotify) {
+    return result({
+      row: committed.row,
+      message: decision.message,
+      ...decisionResultArgs(decision),
+    });
+  }
+  return notifyAttention({
+    row: committed.row,
+    errorCode: decision.errorCode,
+    message: decision.message,
+    issueSummary: decision.issueSummary,
+    severity: decisionSeverity(decision),
+    resultArgs: decisionResultArgs(decision),
   });
 }
 
 export async function handleMissingPaymentReference(row: PaymentLedgerRow) {
-  const message = 'No PayPal capture ID or authorization ID is available for reconciliation.';
-  return attention({
+  const committed = await commitReconciliationDecision({
     row,
-    data: {
-      status: PAYPAL_LEDGER_STATUS.ERROR,
-      lastErrorCode: 'PAYPAL_PAYMENT_REFERENCE_MISSING',
-      lastErrorMessage: message,
-    },
-    errorCode: 'PAYPAL_PAYMENT_REFERENCE_MISSING',
-    message,
-    issueSummary: [
-      message,
-      'Review the PayPal order from the PayPal dashboard before fulfillment.',
-    ],
-    severity: CRITICAL,
-    resultArgs: {
-      ok: false,
-      action: 'missing_payment_reference',
-      status: PAYPAL_LEDGER_STATUS.ERROR,
-    },
+    build: buildMissingPaymentReferenceLedgerDecision,
+  });
+  const decision = committed.transition;
+  if (!decision.shouldNotify) {
+    return result({
+      row: committed.row,
+      message: decision.message,
+      ...decisionResultArgs(decision),
+    });
+  }
+  return notifyAttention({
+    row: committed.row,
+    errorCode: decision.errorCode,
+    message: decision.message,
+    issueSummary: decision.issueSummary,
+    severity: decisionSeverity(decision),
+    resultArgs: decisionResultArgs(decision),
   });
 }

@@ -15,7 +15,8 @@ import type {
   PayPalPaymentReconciliationDashboard,
   PayPalPaymentReconciliationRow,
 } from '@/lib/paypal/txLedger/paymentReconciliationTypes';
-import type { Prisma } from '@/lib/prisma/shop/paypal/txLedger/generated/paypalTxLedger/client';
+import { Prisma } from '@/lib/prisma/shop/paypal/txLedger/generated/paypalTxLedger/client';
+import { reconcileCanonicalPayPalPaymentChain } from '@/lib/paypal/txLedger/canonicalPaymentReconciliation';
 
 const DEFAULT_MIN_AGE_MINUTES = 15;
 const DEFAULT_BATCH_SIZE = 5;
@@ -32,6 +33,9 @@ const PAYMENT_RECONCILIATION_ERROR_CODES = new Set<string>([
   'CAPTURE_FAILED',
   'CAPTURE_NOT_COMPLETED',
   'CAPTURE_PERSIST_FAILED',
+  'CANONICAL_ORDER_SNAPSHOT_INVALID',
+  'PAYPAL_AUTHORIZATION_AMOUNT_MISMATCH',
+  'PAYPAL_CAPTURE_AMOUNT_MISMATCH',
   'PAYPAL_CAPTURE_RECONCILED_AUTHORIZE_PAYLOAD_MISSING',
   'PAYPAL_AUTHORIZATION_CAPTURED_WITHOUT_CAPTURE_PAYLOAD',
   'PAYPAL_AUTHORIZATION_DENIED',
@@ -50,6 +54,9 @@ export const PAYMENT_RECONCILIATION_ROW_SELECT = {
   customerName: true,
   customerEmail: true,
   initialCurrency: true,
+  canonicalOrderSnapshot: true,
+  canonicalOrderSnapshotVersion: true,
+  canonicalOrderSnapshotHash: true,
   authorizePayload: true,
   capturePayload: true,
   status: true,
@@ -101,6 +108,13 @@ function getLocalReason(row: PaymentLedgerRow) {
 
 function getRecommendedAction(row: PaymentLedgerRow) {
   const completion = getPayPalCaptureCompletion(row.capturePayload);
+  if (
+    row.lastErrorCode === 'CANONICAL_ORDER_SNAPSHOT_INVALID' ||
+    row.lastErrorCode === 'PAYPAL_AUTHORIZATION_AMOUNT_MISMATCH' ||
+    row.lastErrorCode === 'PAYPAL_CAPTURE_AMOUNT_MISMATCH'
+  ) {
+    return 'Do not capture or fulfill. Review the canonical order and PayPal amount evidence.';
+  }
   if (completion.captureId && !completion.ok) {
     return 'Check capture status with PayPal and block fulfillment until capture is completed.';
   }
@@ -114,6 +128,9 @@ function getRisk(row: PaymentLedgerRow): PayPalPaymentReconciliationRow['risk'] 
   if (
     row.lastErrorCode === 'CAPTURE_PERSIST_FAILED' ||
     row.lastErrorCode === 'CAPTURE_NOT_COMPLETED' ||
+    row.lastErrorCode === 'CANONICAL_ORDER_SNAPSHOT_INVALID' ||
+    row.lastErrorCode === 'PAYPAL_AUTHORIZATION_AMOUNT_MISMATCH' ||
+    row.lastErrorCode === 'PAYPAL_CAPTURE_AMOUNT_MISMATCH' ||
     (Date.now() - row.updatedAt.getTime()) / 3_600_000 >= 24
   ) {
     return 'critical';
@@ -153,7 +170,18 @@ function mapRow(row: PaymentLedgerRow): PayPalPaymentReconciliationRow {
 
 export function isPaymentReconciliationCandidate(row: PaymentLedgerRow) {
   if (row.processingCompletedAt || !hasPaymentEvidence(row)) return false;
-  if (getPayPalCaptureCompletion(row.capturePayload).ok) return false;
+  const captureCompletion = getPayPalCaptureCompletion(row.capturePayload);
+  if (captureCompletion.ok) {
+    const canonicalReconciliation = reconcileCanonicalPayPalPaymentChain(
+      row,
+      row.authorizePayload,
+      row.capturePayload,
+    );
+    // A completed PayPal capture with corrupt/mismatched canonical evidence is independently
+    // actionable even before another route has persisted an ERROR status/code.
+    if (!canonicalReconciliation.ok) return true;
+    return false;
+  }
 
   return (
     PAYMENT_ATTENTION_STATUSES.has(row.status) ||
@@ -182,6 +210,7 @@ export async function findPayPalPaymentReconciliationRows(args?: {
       updatedAt: { lte: cutoff },
       OR: [
         { paypalAuthorizationId: { not: null } },
+        { capturePayload: { not: Prisma.AnyNull } },
         { status: { in: [...PAYMENT_ATTENTION_STATUSES] } },
         { lastErrorCode: { in: [...PAYMENT_RECONCILIATION_ERROR_CODES] } },
       ],

@@ -1,6 +1,6 @@
 # Merchize Fulfillment Ops Guide
 
-Last updated: 2026-07-24
+Last updated: 2026-08-06
 
 This guide defines the Merchize side of Codex Christi paid order fulfillment processing. It is intentionally separate from the PayPal transaction ledger guide and the admin recovery tooling guide, but it is not merely a post-push sync guide.
 
@@ -14,9 +14,30 @@ This guide is intentionally Merchize-specific. Other POD suppliers can get their
 
 Related source docs:
 
+- `SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md`
 - `PAYPAL_TX_LEDGER_GUIDE.md`
 - `ADMIN_RECOVERY_TOOLING_GUIDE.md`
 - `PAYPAL_WEBHOOK_REGISTRATION_AND_RECOVERY_GUIDE.md`
+
+Release sequencing note:
+
+- `SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md` is now canonical for public-alpha priority, resolved
+  product decisions, customer milestones, and release gates.
+- This guide remains authoritative for detailed Merchize identifiers, endpoint contracts, schemas,
+  readiness rules, and recovery behavior.
+- Older "imminent", phase-order, and open-decision text below is domain backlog context and must not
+  override the canonical release plan.
+
+P0.2 downstream boundary:
+
+- New orders reach this domain with canonical product/variant/supplier IDs, SKUs, options,
+  quantities, prices, currency, and destination from the existing PayPal `PaypalIntent` ledger.
+  Registration, item comparisons, and address-correction targeting use those values.
+- `cartSnapshot` is compatible only for a pre-P0.2 row whose canonical snapshot/version/hash triple
+  is entirely null. Invalid, partial, corrupt, or payment-mismatched canonical rows cannot reach
+  Merchize registration, sync, correction, or production mutation.
+- This does not create a Merchize-owned or standalone order store and does not change destination,
+  currency, or tax policy. Canonical/PayPal/receipt totals remain merchandise plus shipping only.
 
 ---
 
@@ -86,11 +107,12 @@ Retry scope is now explicit:
   `MERCHIZE_ORDER_REGISTRATION_FAILED` instead of collapsing every failure to
   `POST_PROCESSING_FAILED`.
 
-# Imminent Next Implementation: Address Intervention And Lifecycle Hardening
+# Merchize Domain Backlog: Address Intervention And Lifecycle Hardening
 
-Status: **IMMINENT**. This is the canonical next implementation queue after commit `8e9a3bf`.
-It is documented but not yet implemented. When asked "what's next?", start with this section and
-preserve the order below unless new production evidence changes the priority.
+Status: **PARTIALLY IMPLEMENTED, REMAINING WORK SEQUENCED BY THE ALPHA RELEASE GUIDE**.
+The detailed requirements remain useful, but this is no longer the cross-domain canonical "what is
+next" queue. Start with `SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md` and use this section when its active
+P0 slice reaches the Merchize domain.
 
 The next phase must make automatic production release safe for customer-actionable address problems,
 make scanner and email delivery health observable, and finish the minimum useful post-push lifecycle.
@@ -338,21 +360,20 @@ acceptable.
 - Tests cover the disposition matrix, notification dedupe, outbox retry exhaustion, automatic versus
   admin resume, contact-email verification, cron overlap, and multi-package milestone dedupe.
 
-## Decisions to confirm before implementation
+## Decisions resolved by the alpha release plan
 
-Recommended defaults are recorded so the phase remains actionable in a later chat:
+The canonical decisions are now:
 
 1. Use an OTP-protected self-service address correction/confirmation page rather than a
    contact-support-only email.
-2. Auto-resume only after a corrected address receives provider `valid`; keep provider-invalid
-   buyer-confirmed release behind master-admin step-up.
+2. Auto-resume a corrected US address only after provider `valid`; non-US `other`/`others` may
+   auto-resume after exact provider read-back while remaining labeled not provider-validated.
+   A provider-invalid buyer-confirmed US release stays behind master-admin step-up.
 3. Treat `fulfillmentContactEmailOverride` as an operational contact only and preserve original
    payment/Django identity.
-4. Make Codex Christi the lifecycle-email sender only after confirming or disabling overlapping
-   Merchize buyer emails.
-
-If these defaults are not explicitly changed, present them for confirmation before editing schema or
-customer-facing behavior.
+4. Codex Christi owns customer lifecycle email for alpha. Do not depend on unconfirmed Merchize
+   buyer email.
+5. Merchize webhooks are P1. Synchronous reads and scheduled polling must make P0 complete.
 
 ---
 
@@ -1263,7 +1284,10 @@ Implementation rule:
 - A transaction-fee response that indicates unpaid/invalid state is diagnostic until its
   seller-operation contract is verified; it must not override the documented invoice result.
 - If cost changes after address correction, put the order in admin review before charging, refunding, or asking the customer for an extra payment.
-- IOSS/tax display data should be captured as a provider snapshot where relevant, but it should not be shown to customers until the output is understood and formatted safely.
+- IOSS/tax display data may be captured only as provider-side operational evidence where relevant.
+  It is outside P0.2, must not enter the canonical order, PayPal, or receipt totals, and must not be
+  presented as tax collected. Do not show it to customers until its meaning and display policy are
+  separately understood and approved.
 
 ## Progress, history, and support-view endpoints
 
@@ -2486,7 +2510,8 @@ flowchart TD
 
 The admin detail should compare:
 
-- expected cart items from PayPal TX ledger `cartSnapshot`
+- expected items from the PayPal TX ledger canonical order snapshot for P0.2 rows; use
+  `cartSnapshot` only for an all-null pre-P0.2 legacy envelope
 - request items sent to Django process
 - Merchize items returned by Merchize lookup/detail
 

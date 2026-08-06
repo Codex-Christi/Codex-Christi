@@ -7,6 +7,8 @@ import {
 } from '@/lib/paypal/txLedger/processingPolicy';
 import { runPaidFulfillmentProcessing } from '@/lib/paypal/txLedger/runPaidFulfillmentProcessing';
 import { getPayPalCaptureCompletion } from '@/lib/paypal/txLedger/captureCompletion';
+import { reconcileCanonicalPayPalPaymentChain } from '@/lib/paypal/txLedger/canonicalPaymentReconciliation';
+import type { CanonicalOrderSnapshotLedgerEnvelope } from '@/lib/paypal/orderSnapshot/canonicalize';
 import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
 import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
 import {
@@ -71,13 +73,14 @@ function clampBatchSize(batchSize: number) {
   return Math.min(batchSize, MAX_BATCH_SIZE);
 }
 
-function toCandidate(row: {
+function toCandidate(row: CanonicalOrderSnapshotLedgerEnvelope & {
   orderToken: string;
   status: string;
   customerEmail: string;
   customerName: string;
   paypalOrderId: string | null;
   receiptLink: string | null;
+  authorizePayload: unknown;
   capturePayload: unknown;
   createdAt: Date;
   updatedAt: Date;
@@ -85,6 +88,11 @@ function toCandidate(row: {
   lastErrorMessage: string | null;
 }) {
   const captureCompletion = getPayPalCaptureCompletion(row.capturePayload);
+  const paymentChain = reconcileCanonicalPayPalPaymentChain(
+    row,
+    row.authorizePayload,
+    row.capturePayload,
+  );
 
   return {
     orderToken: row.orderToken,
@@ -95,7 +103,7 @@ function toCandidate(row: {
     receiptLink: row.receiptLink,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
-    reason: `${captureCompletion.reason} Post-capture ledger row is still ${row.status}.`,
+    reason: `${paymentChain.ok ? captureCompletion.reason : paymentChain.reconciliation.reason} Post-capture ledger row is still ${row.status}.`,
     lastErrorCode: row.lastErrorCode,
     lastErrorMessage: row.lastErrorMessage,
   };
@@ -130,7 +138,11 @@ export async function findPayPalRecoveryCandidates(args?: {
       customerName: true,
       paypalOrderId: true,
       receiptLink: true,
+      authorizePayload: true,
       capturePayload: true,
+      canonicalOrderSnapshot: true,
+      canonicalOrderSnapshotVersion: true,
+      canonicalOrderSnapshotHash: true,
       createdAt: true,
       updatedAt: true,
       lastErrorCode: true,
@@ -139,7 +151,15 @@ export async function findPayPalRecoveryCandidates(args?: {
   });
 
   return rows
-    .filter((row) => getPayPalCaptureCompletion(row.capturePayload).ok)
+    .filter(
+      (row) =>
+        getPayPalCaptureCompletion(row.capturePayload).ok &&
+        reconcileCanonicalPayPalPaymentChain(
+          row,
+          row.authorizePayload,
+          row.capturePayload,
+        ).ok,
+    )
     .slice(0, batchSize)
     .map((row) => toCandidate(row));
 }

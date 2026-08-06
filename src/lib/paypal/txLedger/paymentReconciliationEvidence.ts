@@ -49,6 +49,18 @@ function getMoneyPayload(payload: unknown) {
   return value && currencyCode ? { value, currencyCode } : null;
 }
 
+function getAuthorizationRecord(payload: unknown) {
+  const nested = firstPath(payload, [
+    ['purchaseUnits', 0, 'payments', 'authorizations', 0],
+    ['purchase_units', 0, 'payments', 'authorizations', 0],
+  ]);
+  const nestedRecord = asRecord(nested);
+  if (nestedRecord && getMoneyPayload(nestedRecord)) return nestedRecord;
+
+  const direct = asRecord(payload);
+  return direct && getMoneyPayload(direct) ? direct : null;
+}
+
 function getRelatedIds(payload: unknown) {
   const data = asRecord(
     asRecord(asRecord(payload)?.supplementaryData)?.relatedIds ??
@@ -111,7 +123,7 @@ export function getRelatedCaptureId(payload: unknown) {
   );
 }
 
-function hasProcessingAuthorizePayload(payload: unknown) {
+export function hasProcessingAuthorizePayload(payload: unknown) {
   return Boolean(getPurchaseUnits(payload).length && getPurchaseUnitCustomId(payload));
 }
 
@@ -157,6 +169,40 @@ function buildMinimalAuthorizePayload(row: PaymentLedgerRow, paymentPayload: unk
   };
 }
 
+/**
+ * Replaces the nested authorization resource in an order-shaped payload with direct provider
+ * evidence. Returns null when either side is not usable, so callers never mistake a direct
+ * authorization resource for the full PayPal order shape needed by downstream processing.
+ */
+export function attachPayPalAuthorizationEvidence(
+  orderPayload: unknown,
+  authorizationEvidence: unknown,
+) {
+  const authorization = getAuthorizationRecord(authorizationEvidence);
+  if (!authorization) return null;
+
+  const cloned = asRecord(safeJson(orderPayload));
+  if (!cloned) return null;
+  const usesSnakeCase = Array.isArray(cloned.purchase_units);
+  const purchaseUnits = usesSnakeCase ? cloned.purchase_units : cloned.purchaseUnits;
+  if (!Array.isArray(purchaseUnits) || !asRecord(purchaseUnits[0])) return null;
+
+  const firstUnit = asRecord(purchaseUnits[0])!;
+  const payments = asRecord(firstUnit.payments) ?? {};
+  const enrichedUnit = {
+    ...firstUnit,
+    payments: {
+      ...payments,
+      authorizations: [safeJson(authorization)],
+    },
+  };
+  const enrichedUnits = [enrichedUnit, ...purchaseUnits.slice(1)];
+
+  return usesSnakeCase
+    ? { ...cloned, purchase_units: enrichedUnits }
+    : { ...cloned, purchaseUnits: enrichedUnits };
+}
+
 export function getProcessingAuthorizePayload({
   row,
   orderPayload,
@@ -168,11 +214,24 @@ export function getProcessingAuthorizePayload({
   paymentPayload?: unknown;
   authorizationPayload?: unknown;
 }) {
-  if (hasProcessingAuthorizePayload(orderPayload)) return orderPayload;
-  if (hasProcessingAuthorizePayload(row.authorizePayload)) return row.authorizePayload;
+  // Keep order/custom-id shape and authorization money evidence as separate concerns. A post-capture
+  // Get Order response can retain purchase-unit amount/customId while omitting authorizations; its
+  // order total is not authorization proof.
+  const processingBase = hasProcessingAuthorizePayload(orderPayload)
+    ? orderPayload
+    : hasProcessingAuthorizePayload(row.authorizePayload)
+      ? row.authorizePayload
+      : buildMinimalAuthorizePayload(row, paymentPayload, authorizationPayload);
+  if (!hasProcessingAuthorizePayload(processingBase)) return null;
 
-  const minimalPayload = buildMinimalAuthorizePayload(row, paymentPayload, authorizationPayload);
-  return hasProcessingAuthorizePayload(minimalPayload) ? minimalPayload : null;
+  const authorizationEvidence =
+    getAuthorizationRecord(authorizationPayload) ??
+    getAuthorizationRecord(row.authorizePayload) ??
+    getAuthorizationRecord(orderPayload);
+
+  return authorizationEvidence
+    ? (attachPayPalAuthorizationEvidence(processingBase, authorizationEvidence) ?? processingBase)
+    : processingBase;
 }
 
 export function safeJson(value: unknown) {

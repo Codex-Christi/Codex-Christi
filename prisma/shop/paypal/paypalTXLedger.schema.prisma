@@ -23,6 +23,9 @@ model PaypalIntent {
   initialCurrency                    String?
   cartSnapshot                       Json
   shippingSnapshot                   Json
+  canonicalOrderSnapshot             Json?
+  canonicalOrderSnapshotVersion      String?
+  canonicalOrderSnapshotHash         String?
   // Raw payloads needed to reuse your existing server actions
   authorizePayload                   Json?
   capturePayload                     Json?

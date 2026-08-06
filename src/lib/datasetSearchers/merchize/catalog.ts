@@ -34,6 +34,25 @@ export type CatalogItem = {
   ROW_additional_shipping_fee: number | null;
 };
 
+export type StrictCatalogVariantRecord = {
+  sku: string;
+  supplierProductId: string;
+  supplierVariantId: string;
+  catalogRow: CatalogItem;
+};
+
+export class MissingMerchizeCatalogSkuError extends Error {
+  readonly code = 'MISSING_MERCHIZE_CATALOG_SKU' as const;
+  readonly missingSkus: string[];
+
+  constructor(missingSkus: string[]) {
+    super(`Merchize catalog rows are missing for: ${missingSkus.join(', ')}.`);
+    this.name = 'MissingMerchizeCatalogSkuError';
+    this.missingSkus = missingSkus;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 // Helper to pick a band by zone ("US", "EU", "GB", ...)
 function bandForZone(bands: ShippingBand[], zone: string): ShippingBand | undefined {
   return bands.find((b) => b.toZone === zone);
@@ -141,4 +160,37 @@ export async function getMultipleSKUsData(skus: string[]): Promise<CatalogItem[]
   }
 
   return result;
+}
+
+/**
+ * Checkout-only catalog lookup. Unlike the display/preview-compatible helper above, this is
+ * deliberately fail-closed and returns the catalog product/variant identity that proves the SKU.
+ */
+export async function getStrictCatalogVariantsBySku(
+  skus: string[],
+): Promise<StrictCatalogVariantRecord[]> {
+  const uniqueSkus = [...new Set(skus.map((sku) => sku.trim()).filter(Boolean))].sort();
+  if (!uniqueSkus.length) return [];
+
+  const variants = await merchizeCatalogPrisma.variant.findMany({
+    where: { sku: { in: uniqueSkus } },
+    include: { product: true, shippingBands: true },
+  });
+  const bySku = new Map(variants.map((variant) => [variant.sku, variant]));
+  const missingSkus = uniqueSkus.filter((sku) => !bySku.has(sku));
+  if (missingSkus.length) throw new MissingMerchizeCatalogSkuError(missingSkus);
+
+  return uniqueSkus.map((sku) => {
+    const variant = bySku.get(sku)!;
+    if (!variant.product?.merchizeId || !variant.merchizeId) {
+      throw new MissingMerchizeCatalogSkuError([sku]);
+    }
+
+    return {
+      sku,
+      supplierProductId: variant.product.merchizeId,
+      supplierVariantId: variant.merchizeId,
+      catalogRow: toCatalogItemFromDb(variant),
+    };
+  });
 }

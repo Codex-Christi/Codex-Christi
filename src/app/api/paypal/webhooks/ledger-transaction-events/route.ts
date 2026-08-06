@@ -4,9 +4,7 @@ import { getPayPalWebhookProcessingOwner } from '@/lib/paypal/ledgerWebhookConfi
 import { resolvePayPalLedgerTrustedWebhookIds } from '@/lib/paypal/ledgerWebhookTrust';
 import type { PayPalLedgerTrustedWebhookCandidate } from '@/lib/paypal/ledgerWebhookTrust';
 import { getServerPayPalConfig } from '@/lib/paypal/serverPayPalConfig';
-import { getPayPalCaptureCompletion } from '@/lib/paypal/txLedger/captureCompletion';
 import { runPaidFulfillmentProcessing } from '@/lib/paypal/txLedger/runPaidFulfillmentProcessing';
-import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
 import {
   ensureWebhookDeliveryRecord,
   getWebhookLedgerCorrelation,
@@ -20,23 +18,13 @@ import {
 } from '@/lib/paypal/txLedger/webhookHelpers';
 import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
 import { refreshPaidOrderRecoveryProjectionSafely } from '@/lib/paypal/txLedger/paidOrderRecoveryProjection';
+import { notifyCanonicalPaymentFailure } from '@/lib/paypal/txLedger/canonicalPaymentFailureNotification';
+import { commitOptimisticLedgerTransition } from '@/lib/paypal/txLedger/optimisticLedgerTransition';
+import { buildPayPalWebhookLedgerTransition } from '@/lib/paypal/txLedger/payPalWebhookLedgerTransition';
+import type { Prisma } from '@/lib/prisma/shop/paypal/txLedger/generated/paypalTxLedger/client';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-
-const POST_CAPTURE_LEDGER_STATUSES = new Set<string>([
-  PAYPAL_LEDGER_STATUS.RECEIPT_UPLOADED,
-  PAYPAL_LEDGER_STATUS.PAYMENT_SAVED,
-  PAYPAL_LEDGER_STATUS.FULFILLMENT_BLOCKED,
-  PAYPAL_LEDGER_STATUS.FULFILLMENT_FAILED,
-  PAYPAL_LEDGER_STATUS.FULFILLMENT_ATTENTION_REQUIRED,
-  PAYPAL_LEDGER_STATUS.COMPLETED,
-]);
-
-const FULFILLMENT_RECOVERY_STATUSES = new Set<string>([
-  PAYPAL_LEDGER_STATUS.FULFILLMENT_BLOCKED,
-  PAYPAL_LEDGER_STATUS.FULFILLMENT_FAILED,
-]);
 
 type PayPalWebhookVerificationHeaders = {
   paypalAuthAlgo: string;
@@ -134,110 +122,36 @@ function getWebhookProcessingOwnershipDecision({
 async function updateLedgerFromWebhook(args: {
   orderToken: string;
   eventType: string;
-  currentStatus: string;
-  currentCapturePayload: unknown;
   webhookResource: unknown;
-}) {
-  const { orderToken, eventType, currentStatus, currentCapturePayload, webhookResource } = args;
-
-  switch (eventType) {
-    case 'PAYMENT.AUTHORIZATION.CREATED':
-      await paypalTxLedger.paypalIntent.update({
-        where: { orderToken },
-        data: {
-          status: PAYPAL_LEDGER_STATUS.AUTHORIZED,
-          lastEventType: eventType,
+}): Promise<{ shouldScheduleFulfillment: boolean }> {
+  const committed = await commitOptimisticLedgerTransition({
+    load: () => paypalTxLedger.paypalIntent.findUnique({ where: { orderToken: args.orderToken } }),
+    build: (row) =>
+      buildPayPalWebhookLedgerTransition(row, args.eventType, args.webhookResource),
+    commit: async (row, transition) => {
+      if (!transition.data) return true;
+      const updated = await paypalTxLedger.paypalIntent.updateMany({
+        where: {
+          orderToken: args.orderToken,
+          status: row.status,
+          updatedAt: row.updatedAt,
         },
+        data: transition.data as Prisma.PaypalIntentUpdateManyMutationInput,
       });
-      return;
+      return updated.count === 1;
+    },
+  });
 
-    case 'PAYMENT.CAPTURE.PENDING':
-      await paypalTxLedger.paypalIntent.update({
-        where: { orderToken },
-        data: {
-          status: PAYPAL_LEDGER_STATUS.PENDING,
-          lastEventType: eventType,
-        },
-      });
-      return;
-
-    case 'PAYMENT.CAPTURE.DENIED':
-    case 'PAYMENT.CAPTURE.DECLINED':
-      await paypalTxLedger.paypalIntent.update({
-        where: { orderToken },
-        data: {
-          status: PAYPAL_LEDGER_STATUS.ERROR,
-          lastEventType: eventType,
-          lastErrorCode: 'CAPTURE_DECLINED',
-          lastErrorMessage: 'PayPal capture declined',
-        },
-      });
-      return;
-
-    case 'PAYMENT.CAPTURE.REFUNDED':
-      await paypalTxLedger.paypalIntent.update({
-        where: { orderToken },
-        data: {
-          status: PAYPAL_LEDGER_STATUS.REFUNDED,
-          lastEventType: eventType,
-        },
-      });
-      return;
-
-    case 'PAYMENT.CAPTURE.COMPLETED': {
-      const currentCaptureCompletion = getPayPalCaptureCompletion(currentCapturePayload);
-      const webhookCaptureCompletion = getPayPalCaptureCompletion(webhookResource);
-      const completedCapturePayload = currentCaptureCompletion.ok
-        ? undefined
-        : webhookCaptureCompletion.ok
-          ? JSON.parse(JSON.stringify(webhookResource))
-          : undefined;
-
-      if (!currentCaptureCompletion.ok && !webhookCaptureCompletion.ok) {
-        await paypalTxLedger.paypalIntent.update({
-          where: { orderToken },
-          data: {
-            status: PAYPAL_LEDGER_STATUS.ERROR,
-            lastEventType: eventType,
-            lastErrorCode: 'CAPTURE_NOT_COMPLETED',
-            lastErrorMessage: webhookCaptureCompletion.reason,
-          },
-        });
-        return;
-      }
-
-      // Do not move the row backward if post-processing already advanced it.
-      if (!POST_CAPTURE_LEDGER_STATUSES.has(currentStatus)) {
-        await paypalTxLedger.paypalIntent.update({
-          where: { orderToken },
-          data: {
-            status: PAYPAL_LEDGER_STATUS.CAPTURED,
-            capturePayload: completedCapturePayload,
-            lastEventType: eventType,
-          },
-        });
-      } else if (completedCapturePayload) {
-        await paypalTxLedger.paypalIntent.update({
-          where: { orderToken },
-          data: {
-            capturePayload: completedCapturePayload,
-            lastEventType: eventType,
-          },
-        });
-      } else {
-        await paypalTxLedger.paypalIntent.update({
-          where: { orderToken },
-          data: {
-            lastEventType: eventType,
-          },
-        });
-      }
-      return;
-    }
-
-    default:
-      return;
+  if (committed.transition.reconciliationFailure) {
+    await notifyCanonicalPaymentFailure(
+      committed.row,
+      committed.transition.reconciliationFailure,
+    );
   }
+
+  return {
+    shouldScheduleFulfillment: committed.transition.shouldScheduleFulfillment,
+  };
 }
 
 export async function POST(req: Request) {
@@ -348,22 +262,15 @@ export async function POST(req: Request) {
       return new Response('Retry later', { status: 500 });
     }
 
-    if (row.status === PAYPAL_LEDGER_STATUS.COMPLETED) {
-      await markWebhookProcessed(event.id);
-      return new Response('OK', { status: 200 });
-    }
-
-    await updateLedgerFromWebhook({
+    const ledgerUpdate = await updateLedgerFromWebhook({
       orderToken: row.orderToken,
       eventType: event.event_type,
-      currentStatus: row.status,
-      currentCapturePayload: row.capturePayload,
       webhookResource: event.resource,
     });
     await refreshPaidOrderRecoveryProjectionSafely(row.orderToken);
 
     if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
-      if (FULFILLMENT_RECOVERY_STATUSES.has(row.status)) {
+      if (!ledgerUpdate.shouldScheduleFulfillment) {
         await markWebhookProcessed(event.id);
         return new Response('OK', { status: 200 });
       }

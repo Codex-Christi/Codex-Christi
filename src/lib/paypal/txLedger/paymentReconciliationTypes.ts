@@ -5,6 +5,9 @@ export type PaymentLedgerRow = {
   customerName: string;
   customerEmail: string;
   initialCurrency: string | null;
+  canonicalOrderSnapshot: unknown | null;
+  canonicalOrderSnapshotVersion: string | null;
+  canonicalOrderSnapshotHash: string | null;
   authorizePayload: unknown;
   capturePayload: unknown;
   status: string;

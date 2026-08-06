@@ -8,9 +8,13 @@ import type { CartVariant } from '@/stores/shop_stores/cartStore';
 import type { PaymentSavingActionProps } from '@/actions/shop/paypal/processAndUploadCompletedTx/savePaymentDataToBackend';
 import { encryptForPostProcessingServerAction } from '@/lib/utils/shop/checkout/serverPostProcessingCrypto';
 import { normalizeCountryToIso2 } from '@/lib/utils/shop/checkout/normalizeCountryToIso3';
+import type { CanonicalOrderSnapshot } from '@/lib/paypal/orderSnapshot/types';
+import { parseCanonicalOrderSnapshot } from '@/lib/paypal/orderSnapshot/canonicalize';
+import { getCanonicalFulfillmentItems } from '@/lib/paypal/orderSnapshot/consumerData';
 
 export type MerchizeFulfillmentOrderArgs = {
   cartSnapshot: CartVariant[];
+  canonicalOrderSnapshot?: CanonicalOrderSnapshot | null;
   djangoPaymentSaveCustomId: string;
   identifier: string;
   currency: string;
@@ -236,7 +240,10 @@ function buildFulfillmentPayload(
 }
 
 export async function sendMerchizeFulfillmentOrder(args: MerchizeFulfillmentOrderArgs) {
-  const items = mapCartToProcessingItems(args.cartSnapshot, args.currency);
+  // Canonical orders never consult the browser cart. Legacy rows retain their original mapping.
+  const items = args.canonicalOrderSnapshot
+    ? getCanonicalFulfillmentItems(parseCanonicalOrderSnapshot(args.canonicalOrderSnapshot))
+    : mapCartToProcessingItems(args.cartSnapshot, args.currency);
   const requestPayload = buildFulfillmentPayload(args, items);
   const validationIssues = getFulfillmentPayloadIssues(requestPayload);
 

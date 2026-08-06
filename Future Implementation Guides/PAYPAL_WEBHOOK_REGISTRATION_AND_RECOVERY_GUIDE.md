@@ -1,14 +1,24 @@
 # PayPal Webhook Registration And Recovery Guide
 
-Last updated: 2026-06-20
+Last updated: 2026-08-06
 
 This guide documents the current PayPal webhook and post-payment recovery state in the repository, then defines the safe implementation path for webhook registration, sandbox/live payment-mode separation, and recovery behavior.
 
 Related source docs:
 
+- `SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md`
 - `PAYPAL_TX_LEDGER_GUIDE.md`
 - `ADMIN_RECOVERY_TOOLING_GUIDE.md`
 - `MERCHIZE_FULFILLMENT_OPS_GUIDE.md`
+
+Release sequencing:
+
+- `SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md` is canonical for public-alpha priority.
+- This guide covers PayPal webhooks. Its guidance must not be confused with the P1 Merchize webhook
+  plan in the alpha release guide.
+- The accepted alpha trigger policy keeps the explicitly enabled capture-route continuation as the
+  fast path, the recovery scanner as the durable fallback, PayPal webhooks as a payment-event safety
+  net, and the confirmation status route read-only.
 
 ## Current Repository State
 
@@ -39,9 +49,16 @@ That runner performs these follow-up steps after PayPal capture already exists:
 
 It does not authorize or capture PayPal money. Authorization and capture happen earlier in the PayPal approval/capture flow.
 
+Before any follow-up side effect, P0.2 requires the shared full payment chain: the persisted PayPal
+authorization and completed capture must each match the sealed canonical total/currency. Webhook,
+capture recovery, payment reconciliation, scanners, the runner, receipt regeneration, and mutating
+admin recovery cannot bypass this gate. Only a row whose canonical snapshot/version/hash are all
+null uses the legacy compatibility path.
+
 ## Current Trigger Points
 
-There are currently four ways post-processing can start.
+There are currently three mutation-capable ways post-processing can start, plus one read-only
+status consumer.
 
 ### 1. Capture Route Trigger
 
@@ -55,8 +72,11 @@ Current behavior:
 
 - Captures the authorized PayPal payment.
 - Persists `capturePayload` on the ledger row.
-- Schedules the real paid order fulfillment orchestrator with `after(...)`.
-- If the capture payload already exists, it does not capture again. It can still resume post-processing for resumable statuses.
+- Reconciles both persisted authorization and completed capture money against the canonical snapshot
+  before marking the row captured or scheduling the real paid order fulfillment orchestrator with
+  `after(...)`.
+- If the capture payload already exists, it does not capture again. It can resume post-processing
+  for resumable statuses only after the same full-chain reconciliation passes.
 
 This means a checkout can complete even when the PayPal webhook is unavailable, as long as the Next.js server is running and the capture route finishes successfully.
 
@@ -75,10 +95,19 @@ Current behavior:
 - Stores webhook delivery records in `PaypalWebhookEvent`.
 - Correlates events to ledger rows using PayPal order ID first, then local `orderToken` from PayPal `custom_id` or `invoice_id`.
 - Updates ledger state for PayPal authorization/capture/refund events.
-- On `PAYMENT.CAPTURE.COMPLETED`, schedules the real paid order fulfillment orchestrator with `after(...)`.
-- Does not move `fulfillment_blocked` or `fulfillment_failed` rows backward.
+- On `PAYMENT.CAPTURE.COMPLETED`, preserves capture evidence, applies the full canonical
+  authorization-plus-capture reconciliation, and schedules the real paid order fulfillment
+  orchestrator with `after(...)` only when it passes.
+- Persists verified authorization ID/evidence and resynchronizes an order-shaped payload when the
+  authorization webhook wins the normal route race.
+- Re-reads and compare-and-swaps payment transitions, rebuilding after concurrent ledger changes
+  before it schedules fulfillment.
+- Still inspects delayed payment evidence for completed rows. A contradiction becomes a durable
+  incident, while matching delayed events do not replay fulfillment.
+- Does not move `fulfillment_blocked`, `fulfillment_failed`, completed, or other post-capture rows
+  backward; in particular, an out-of-order `PAYMENT.CAPTURE.PENDING` event is evidence-only.
 
-### 3. Confirmation Status Route Resume
+### 3. Confirmation Status Route (read-only)
 
 File:
 
@@ -89,9 +118,8 @@ src/app/api/paypal/tx-ledger/payments/[orderToken]/status/route.ts
 Current behavior:
 
 - Returns the current ledger status to the confirmation page.
-- If the row is captured or partially processed, has no active lock, has no error, and is not completed, it schedules the real paid order fulfillment orchestrator with `after(...)`.
-
-This is a useful local-development safety net, but it is a hidden side effect in a status endpoint. It means a customer-facing polling route can indirectly resume receipt generation, Django payment save, and fulfillment push.
+- Performs no post-processing scheduling, provider mutation, or recovery write. Customer-facing
+  polling remains outside the mutation trust boundary.
 
 ### 4. Admin Retry Trigger
 
@@ -142,11 +170,15 @@ Decision needed:
 - Keep capture-route post-processing as the intentional immediate server trigger, with webhook as backup.
 - Or make webhook/scheduled recovery the only automatic post-capture trigger.
 
-Recommended current default:
+Accepted alpha default:
 
-- Keep capture-route runner disabled so post-payment work stays backend-runner driven.
-- Use webhook delivery plus the recovery scanner as the automatic completion paths.
-- Keep the webhook registered and verified because it is still needed when the capture route fails, the user leaves, or PayPal sends later capture/refund/dispute events.
+- Keep `PAYPAL_TX_LEDGER_ENABLE_CAPTURE_ROUTE_RUNNER=true` explicitly configured so the server can
+  begin paid fulfillment immediately after durable capture.
+- Treat the route's `after(...)` work as opportunistic. The recovery scanner remains the durable
+  completion path if the process exits or a provider is temporarily unavailable.
+- Keep the PayPal webhook registered and verified for payment-event reconciliation and later
+  capture/refund/dispute events.
+- Keep confirmation polling read-only.
 
 Recommended hardened production target:
 
@@ -374,18 +406,18 @@ The long-term rule:
 Add clear env flags:
 
 ```txt
-PAYPAL_TX_LEDGER_ENABLE_CAPTURE_ROUTE_RUNNER=false
+PAYPAL_TX_LEDGER_ENABLE_CAPTURE_ROUTE_RUNNER=true
 PAYPAL_TX_LEDGER_RECOVERY_SCANNER_ENABLED=true
 PAYPAL_TX_LEDGER_RECOVERY_SCANNER_MIN_AGE_MINUTES=15
 PAYPAL_TX_LEDGER_RECOVERY_SCANNER_BATCH_SIZE=5
 PAYPAL_TX_LEDGER_RECOVERY_SCANNER_SECRET=...
 ```
 
-Recommended behavior:
+Accepted behavior:
 
-- Capture route runner disabled by default.
-- Webhook runner enabled.
-- Recovery scanner enabled.
+- Capture route runner is explicitly enabled for the fast path.
+- PayPal webhook processing remains enabled and verified.
+- Recovery scanner is enabled as the durable fallback.
 - Confirmation status route remains read-only.
 
 ### Step 2 - Keep Status Route Read-Only
@@ -536,7 +568,15 @@ Admin UI should eventually expose:
 
 ## Open Questions
 
-1. Should capture-route post-processing remain enabled in production as the immediate first-party runner, or should it only persist capture and let webhook/scheduled recovery do the rest?
-2. Which production domain is the canonical PayPal live payment webhook endpoint?
-3. Should staging use a stable sandbox webhook URL instead of local ngrok for repeatable QA?
-4. What scheduled job mechanism will run recovery scans: Vercel cron, VPS cron, a private admin endpoint, or a dedicated worker?
+Resolved:
+
+1. Capture-route post-processing remains explicitly enabled as the immediate first-party runner.
+2. Confirmation status remains read-only.
+3. The existing authenticated scheduled route remains the durable recovery mechanism.
+
+Deployment-specific items:
+
+1. Confirm which production domain is the canonical PayPal live payment webhook endpoint.
+2. Prefer a stable deployed sandbox URL over local ngrok for repeatable QA.
+3. Keep the existing external cron calling the authenticated recovery route and add heartbeat
+   observability per the alpha release guide.

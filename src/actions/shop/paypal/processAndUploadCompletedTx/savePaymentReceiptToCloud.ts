@@ -6,10 +6,12 @@ import { uploadPaymentReceiptToR2 } from '../../checkout/transactions/uploadPaym
 import { createPaypalShopInvoicePDF } from '../createShopInvoicePDF';
 import type { CompletedTxInterface } from '@/types/shop/paypalCompletedTx';
 import { decryptForPostProcessingServerAction } from '@/lib/utils/shop/checkout/serverPostProcessingCrypto';
+import type { CanonicalOrderSnapshot } from '@/lib/paypal/orderSnapshot/types';
 
 export interface PaymentReceiptProps {
   authData: CompletedTxInterface['authData'];
   cart?: CompletedTxInterface['cart'];
+  canonicalOrderSnapshot?: CanonicalOrderSnapshot | null;
   customer: CompletedTxInterface['customer'];
   ORD_string: CompletedTxInterface['ORD_string'];
   shippingAddressOverride?: {
@@ -25,12 +27,24 @@ export interface PaymentReceiptProps {
 export const savePaymentReceiptToCloud = async (encodedProps: string) => {
   try {
     // Decrypt and parse data
-    const { authData, cart, customer, ORD_string, shippingAddressOverride } = JSON.parse(
+    const {
+      authData,
+      cart,
+      canonicalOrderSnapshot,
+      customer,
+      ORD_string,
+      shippingAddressOverride,
+    } = JSON.parse(
       decryptForPostProcessingServerAction(encodedProps),
     ) as PaymentReceiptProps;
     const { email: customerEmail, name: customerName } = customer || {};
 
-    const pdfBuffer = await createPaypalShopInvoicePDF(authData, cart, shippingAddressOverride);
+    const pdfBuffer = await createPaypalShopInvoicePDF(
+      authData,
+      cart,
+      shippingAddressOverride,
+      canonicalOrderSnapshot,
+    );
 
     // Upload to r2
     const { accessLink } = await uploadPaymentReceiptToR2({

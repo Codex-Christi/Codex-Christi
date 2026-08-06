@@ -8,7 +8,6 @@ import {
   getRelatedAuthorizationId,
   getRelatedCaptureId,
   getRelatedOrderId,
-  safeJson,
 } from '@/lib/paypal/txLedger/paymentReconciliationEvidence';
 import {
   handleMissingPaymentReference,
@@ -19,9 +18,6 @@ import type {
   PaymentLedgerRow,
   PayPalPaymentReconciliationResult,
 } from '@/lib/paypal/txLedger/paymentReconciliationTypes';
-import { refreshPaidOrderRecoveryProjectionSafely } from '@/lib/paypal/txLedger/paidOrderRecoveryProjection';
-import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
-import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
 
 async function getPayPalOrderPayload({
   orders,
@@ -99,24 +95,12 @@ export async function reconcilePaymentRow(
     const authorizationId = getRelatedAuthorizationId(orderPayload);
 
     if (authorizationId) {
-      await paypalTxLedger.paypalIntent.update({
-        where: { orderToken: row.orderToken },
-        data: {
-          paypalOrderId: knownOrderId,
-          paypalAuthorizationId: authorizationId,
-          authorizePayload: safeJson(orderPayload),
-          status: PAYPAL_LEDGER_STATUS.AUTHORIZED,
-        },
-      });
-      await refreshPaidOrderRecoveryProjectionSafely(row.orderToken);
-
       const { result: authorization } = await payments.getAuthorizedPayment({ authorizationId });
       return handleReconciledAuthorization({
         row: {
           ...row,
           paypalOrderId: knownOrderId,
           paypalAuthorizationId: authorizationId,
-          authorizePayload: orderPayload,
         },
         payload: authorization,
         orderPayload,

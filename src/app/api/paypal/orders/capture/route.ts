@@ -7,12 +7,24 @@ import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
 import { createPayPalRouteResponders } from '@/lib/paypal/txLedger/routeResponses';
 import { runPaidFulfillmentProcessing } from '@/lib/paypal/txLedger/runPaidFulfillmentProcessing';
 import { isCaptureRouteRunnerEnabled } from '@/lib/paypal/txLedger/processingPolicy';
-import {
-  getPayPalCaptureCompletion,
-  type PayPalCaptureCompletion,
-} from '@/lib/paypal/txLedger/captureCompletion';
+import { getPayPalCaptureCompletion } from '@/lib/paypal/txLedger/captureCompletion';
 import { refreshPaidOrderRecoveryProjectionSafely } from '@/lib/paypal/txLedger/paidOrderRecoveryProjection';
 import { getCheckoutSurfaceProvenance } from '@/lib/paypal/txLedger/checkoutSurfaceProvenance';
+import {
+  reconcileCanonicalPayPalAuthorization,
+  reconcileCanonicalPayPalPaymentChain,
+  type CanonicalPaymentReconciliationResult,
+} from '@/lib/paypal/txLedger/canonicalPaymentReconciliation';
+import {
+  notifyCanonicalPaymentFailure,
+  type CanonicalPaymentFailureNotificationContext,
+} from '@/lib/paypal/txLedger/canonicalPaymentFailureNotification';
+import { commitOptimisticLedgerTransition } from '@/lib/paypal/txLedger/optimisticLedgerTransition';
+import {
+  buildPayPalCaptureFailureLedgerTransition,
+  buildPayPalWebhookLedgerTransition,
+} from '@/lib/paypal/txLedger/payPalWebhookLedgerTransition';
+import type { Prisma } from '@/lib/prisma/shop/paypal/txLedger/generated/paypalTxLedger/client';
 
 const POST_CAPTURE_RESUMABLE_STATUSES = new Set<string>([
   PAYPAL_LEDGER_STATUS.CAPTURED,
@@ -20,15 +32,6 @@ const POST_CAPTURE_RESUMABLE_STATUSES = new Set<string>([
   PAYPAL_LEDGER_STATUS.PAYMENT_SAVED,
   PAYPAL_LEDGER_STATUS.ERROR,
 ]);
-
-function getLedgerStatusForIncompleteCapture(completion: PayPalCaptureCompletion) {
-  if (completion.status === 'PENDING') return PAYPAL_LEDGER_STATUS.PENDING;
-  if (completion.status === 'REFUNDED' || completion.status === 'PARTIALLY_REFUNDED') {
-    return PAYPAL_LEDGER_STATUS.REFUNDED;
-  }
-
-  return PAYPAL_LEDGER_STATUS.ERROR;
-}
 
 export async function POST(req: Request) {
   const requestId = randomUUID();
@@ -48,6 +51,27 @@ export async function POST(req: Request) {
       stage: 'validate_request',
       message,
     });
+
+  const persistCaptureFailure = async (failure: { code: string; message: string }) => {
+    await commitOptimisticLedgerTransition({
+      load: () => paypalTxLedger.paypalIntent.findUnique({ where: { orderToken } }),
+      build: (latest) => {
+        const transition = buildPayPalCaptureFailureLedgerTransition(latest, failure);
+        return {
+          ...transition,
+          data: { ...transition.data, ...checkoutSurface },
+        };
+      },
+      commit: async (latest, transition) => {
+        const updated = await paypalTxLedger.paypalIntent.updateMany({
+          where: { orderToken, status: latest.status, updatedAt: latest.updatedAt },
+          data: transition.data as Prisma.PaypalIntentUpdateManyMutationInput,
+        });
+        return updated.count === 1;
+      },
+    });
+    if (orderToken) await refreshPaidOrderRecoveryProjectionSafely(orderToken);
+  };
 
   // Keep logging, ledger error persistence, and client-safe error responses in one place.
   const fail = async ({
@@ -73,17 +97,10 @@ export async function POST(req: Request) {
       stack: err instanceof Error ? err.stack : undefined,
     });
     if (persistToLedger && orderToken) {
-      await paypalTxLedger.paypalIntent
-        .update({
-          where: { orderToken },
-          data: {
-            status: PAYPAL_LEDGER_STATUS.ERROR,
-            lastErrorCode: code,
-            lastErrorMessage: err instanceof Error ? err.message : String(err),
-          },
-        })
-        .catch(() => undefined);
-      await refreshPaidOrderRecoveryProjectionSafely(orderToken);
+      await persistCaptureFailure({
+        code,
+        message: err instanceof Error ? err.message : String(err),
+      }).catch(() => undefined);
     }
     return routeError({
       status,
@@ -93,44 +110,77 @@ export async function POST(req: Request) {
     });
   };
 
-  const persistIncompleteCaptureResult = async (
-    payload: CapturedPayment | unknown,
-    completion: PayPalCaptureCompletion,
+  const persistCanonicalPaymentFailure = async (
+    reconciliation: CanonicalPaymentReconciliationResult,
+    payload?: CapturedPayment | unknown,
+    notificationContext?: CanonicalPaymentFailureNotificationContext,
   ) => {
     await paypalTxLedger.paypalIntent.update({
       where: { orderToken },
       data: {
-        status: getLedgerStatusForIncompleteCapture(completion),
-        capturePayload: JSON.parse(JSON.stringify(payload)),
-        lastErrorCode: 'CAPTURE_NOT_COMPLETED',
-        lastErrorMessage: completion.reason,
+        status: PAYPAL_LEDGER_STATUS.ERROR,
+        ...(payload === undefined
+          ? {}
+          : { capturePayload: JSON.parse(JSON.stringify(payload)) }),
+        lastErrorCode: reconciliation.errorCode,
+        lastErrorMessage: reconciliation.reason,
         ...checkoutSurface,
       },
     });
     if (orderToken) await refreshPaidOrderRecoveryProjectionSafely(orderToken);
+    if (notificationContext) {
+      await notifyCanonicalPaymentFailure(notificationContext, reconciliation);
+    }
   };
 
-  const persistCapturedResult = async (payload: CapturedPayment) => {
+  const persistCapturedResult = async (payload: CapturedPayment | unknown) => {
     const completion = getPayPalCaptureCompletion(payload);
-
-    if (!completion.ok) {
-      await persistIncompleteCaptureResult(payload, completion);
-      return completion;
-    }
-
-    await paypalTxLedger.paypalIntent.update({
-      where: { orderToken },
-      data: {
-        status: PAYPAL_LEDGER_STATUS.CAPTURED,
-        capturePayload: JSON.parse(JSON.stringify(payload)),
-        lastErrorCode: null,
-        lastErrorMessage: null,
-        ...checkoutSurface,
+    const transitionEventType = completion.ok
+      ? 'PAYMENT.CAPTURE.COMPLETED'
+      : completion.status === 'PENDING'
+        ? 'PAYMENT.CAPTURE.PENDING'
+        : completion.status === 'REFUNDED' || completion.status === 'PARTIALLY_REFUNDED'
+          ? 'PAYMENT.CAPTURE.REFUNDED'
+          : completion.status === 'DENIED' || completion.status === 'DECLINED'
+            ? 'PAYMENT.CAPTURE.DENIED'
+            : 'PAYMENT.CAPTURE.COMPLETED';
+    const committed = await commitOptimisticLedgerTransition({
+      load: () => paypalTxLedger.paypalIntent.findUnique({ where: { orderToken } }),
+      build: (latest) => {
+        const transition = buildPayPalWebhookLedgerTransition(
+          latest,
+          transitionEventType,
+          payload,
+        );
+        const paymentData = { ...(transition.data ?? {}) };
+        delete paymentData.lastEventType;
+        return {
+          ...transition,
+          data: { ...paymentData, ...checkoutSurface },
+        };
+      },
+      commit: async (latest, transition) => {
+        const updated = await paypalTxLedger.paypalIntent.updateMany({
+          where: { orderToken, status: latest.status, updatedAt: latest.updatedAt },
+          data: transition.data as Prisma.PaypalIntentUpdateManyMutationInput,
+        });
+        return updated.count === 1;
       },
     });
-    if (orderToken) await refreshPaidOrderRecoveryProjectionSafely(orderToken);
 
-    return completion;
+    if (orderToken) await refreshPaidOrderRecoveryProjectionSafely(orderToken);
+    if (committed.transition.reconciliationFailure) {
+      await notifyCanonicalPaymentFailure(
+        committed.row,
+        committed.transition.reconciliationFailure,
+      );
+    }
+
+    return {
+      completion,
+      reconciliation: committed.transition.reconciliationFailure,
+      shouldScheduleFulfillment: committed.transition.shouldScheduleFulfillment,
+    };
   };
 
   const schedulePostProcessing = (token: string, reason: string) => {
@@ -191,14 +241,31 @@ export async function POST(req: Request) {
       const completion = getPayPalCaptureCompletion(intent.capturePayload);
 
       if (!completion.ok) {
-        await persistIncompleteCaptureResult(intent.capturePayload, completion).catch(
-          () => undefined,
-        );
+        await persistCapturedResult(intent.capturePayload).catch(() => undefined);
         return routeError({
           status: 409,
           code: 'CAPTURE_NOT_COMPLETED',
           stage: 'validate_stored_capture',
           message: completion.reason,
+        });
+      }
+
+      const paymentChain = reconcileCanonicalPayPalPaymentChain(
+        intent,
+        intent.authorizePayload,
+        intent.capturePayload,
+      );
+      if (!paymentChain.ok) {
+        await persistCanonicalPaymentFailure(
+          paymentChain.reconciliation,
+          intent.capturePayload,
+          intent,
+        );
+        return routeError({
+          status: 409,
+          code: paymentChain.reconciliation.errorCode,
+          stage: `reconcile_stored_${paymentChain.failedAt}_amount`,
+          message: paymentChain.reconciliation.reason,
         });
       }
 
@@ -234,6 +301,20 @@ export async function POST(req: Request) {
       });
     }
 
+    const authorizationReconciliation = reconcileCanonicalPayPalAuthorization(
+      intent,
+      intent.authorizePayload,
+    );
+    if (!authorizationReconciliation.ok) {
+      await persistCanonicalPaymentFailure(authorizationReconciliation, undefined, intent);
+      return routeError({
+        status: 409,
+        code: authorizationReconciliation.errorCode,
+        stage: 'reconcile_authorization_amount',
+        message: authorizationReconciliation.reason,
+      });
+    }
+
     // Main Paymnet Capture from SDK
     const payments = new PaymentsController(getPayPalClient());
     const { result } = await payments.captureAuthorizedPayment({
@@ -245,7 +326,8 @@ export async function POST(req: Request) {
     });
 
     try {
-      const completion = await persistCapturedResult(result);
+      const { completion, reconciliation, shouldScheduleFulfillment } =
+        await persistCapturedResult(result);
 
       if (!completion.ok) {
         return routeError({
@@ -256,7 +338,18 @@ export async function POST(req: Request) {
         });
       }
 
-      schedulePostProcessing(orderToken, 'capture_persisted');
+      if (reconciliation && !reconciliation.ok) {
+        return routeError({
+          status: 409,
+          code: reconciliation.errorCode,
+          stage: 'reconcile_capture_amount',
+          message: reconciliation.reason,
+        });
+      }
+
+      if (shouldScheduleFulfillment) {
+        schedulePostProcessing(orderToken, 'capture_persisted');
+      }
     } catch (persistErr) {
       // Keep this separate so retries know PayPal may already be ahead of the ledger.
       return fail({

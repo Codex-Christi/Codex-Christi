@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { getPayPalCaptureCompletion } from '@/lib/paypal/txLedger/captureCompletion';
 import { PAYPAL_LEDGER_STATUS } from '@/lib/paypal/txLedger/status';
 import { paypalTxLedger } from '@/lib/prisma/shop/paypal/paypalTxLedger';
+import { getCanonicalPaymentProjectionState } from '@/lib/paypal/txLedger/canonicalPaymentProjectionState';
 
 type PageProps = {
   params: Promise<{ orderToken: string }>;
@@ -21,7 +22,9 @@ const CUSTOMER_RECOVERY_LEDGER_STATUSES = new Set<string>([
 
 function getPaidAmountLabel(capturePayload: unknown) {
   const completion = getPayPalCaptureCompletion(capturePayload);
-  if (!completion.amount) return null;
+  // A field labeled "Paid" must come from completed capture evidence, never an authorization,
+  // pending capture, or the expected canonical order total.
+  if (!completion.ok || !completion.amount) return null;
 
   const value = Number(completion.amount.value);
   if (!Number.isFinite(value)) {
@@ -70,21 +73,28 @@ export async function GET(_req: Request, { params }: PageProps) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
 
-  const captureCompletion = getPayPalCaptureCompletion(row.capturePayload);
+  const paymentState = getCanonicalPaymentProjectionState(row);
+  const { captureCompletion, paymentFailure } = paymentState;
   const unresolvedAgeMs = Date.now() - row.updatedAt.getTime();
   const isResolved =
-    row.status === PAYPAL_LEDGER_STATUS.COMPLETED ||
-    row.status === PAYPAL_LEDGER_STATUS.REFUNDED ||
-    Boolean(row.processingCompletedAt);
+    !paymentFailure &&
+    (row.status === PAYPAL_LEDGER_STATUS.COMPLETED ||
+      row.status === PAYPAL_LEDGER_STATUS.REFUNDED ||
+      Boolean(row.processingCompletedAt));
   const isCustomerProtectionVisible =
     captureCompletion.ok &&
     !isResolved &&
-    CUSTOMER_RECOVERY_LEDGER_STATUSES.has(row.status) &&
-    unresolvedAgeMs >= CUSTOMER_RECOVERY_GRACE_MS;
+    (Boolean(paymentFailure) ||
+      (CUSTOMER_RECOVERY_LEDGER_STATUSES.has(row.status) &&
+        unresolvedAgeMs >= CUSTOMER_RECOVERY_GRACE_MS));
+  const effectiveStatus = paymentFailure ? PAYPAL_LEDGER_STATUS.ERROR : row.status;
+  const recoveryReason = paymentFailure
+    ? 'Your payment was received, but its amount requires review before fulfillment.'
+    : getCustomerRecoveryReason(effectiveStatus);
 
   return NextResponse.json({
     orderToken: row.orderToken,
-    status: row.status,
+    status: effectiveStatus,
     lastEventType: row.lastEventType,
     receiptLink: row.receiptLink,
     receiptFile: row.receiptFile,
@@ -92,8 +102,12 @@ export async function GET(_req: Request, { params }: PageProps) {
     processingCompletedAt: row.processingCompletedAt,
     paidAmountLabel: getPaidAmountLabel(row.capturePayload),
     customerRecoveryStatus: isCustomerProtectionVisible ? 'paid_unresolved' : null,
-    recoveryReason: isCustomerProtectionVisible ? getCustomerRecoveryReason(row.status) : null,
+    recoveryReason: isCustomerProtectionVisible ? recoveryReason : null,
     updatedAt: row.updatedAt,
-    error: row.lastErrorMessage ? { code: row.lastErrorCode, message: row.lastErrorMessage } : null,
+    error: paymentFailure
+      ? { code: paymentFailure.errorCode, message: recoveryReason }
+      : row.lastErrorMessage
+        ? { code: row.lastErrorCode, message: row.lastErrorMessage }
+        : null,
   });
 }

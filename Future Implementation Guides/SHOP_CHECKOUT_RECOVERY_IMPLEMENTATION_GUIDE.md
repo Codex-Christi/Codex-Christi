@@ -1,10 +1,19 @@
 # Shop Checkout Recovery Implementation Guide
 
-Last updated: 2026-07-23
+Last updated: 2026-08-06
 
 This guide summarizes the customer-side checkout recovery architecture around Django order-intent OTP, Next.js-owned paid checkout recovery OTP, and the PayPal transaction ledger.
 
 It replaces the older chat-handoff naming and should be treated as the portable implementation reference for continuing this work in another thread or by another engineer.
+
+Release sequencing:
+
+- `SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md` is canonical for public-alpha priority, secure
+  confirmation access, customer milestones, policy acknowledgement, and E2E release gates.
+- This guide remains the detailed reference for Django order-intent OTP and paid-checkout recovery
+  OTP.
+- The older "Next Recommended Implementation Step" near the end is historical domain context and
+  does not override the canonical release plan.
 
 ## Current Problem Area
 
@@ -303,10 +312,16 @@ src/app/api/paypal/tx-ledger/payments/[orderToken]/status/route.ts
 
 Receipt generation originally depended only on PayPal authorization payload line items. If PayPal did not echo item-level data, the receipt had totals but no item rows.
 
-Fix direction:
+P0.2 supersedes the earlier general cart fallback direction:
 
-- Pass `cartSnapshot` from ledger into receipt generation.
-- Use cart snapshot as fallback line items when PayPal payload lacks items.
+- New rows generate receipt lines and merchandise/shipping totals only from the validated canonical
+  order snapshot.
+- Admin receipt regeneration first requires completed PayPal capture evidence and an exact
+  authorization-plus-capture match to that snapshot.
+- Use `cartSnapshot` only for a pre-P0.2 row whose canonical snapshot/version/hash fields are all
+  null. Partial, corrupt, or mismatched canonical metadata must fail closed.
+- A display labeled paid amount uses the actual completed PayPal capture. The canonical total is the
+  expected order value and must not be shown as paid when the two differ.
 
 Relevant files:
 
@@ -348,7 +363,8 @@ Core capabilities:
 - Show related checkout recovery OTP activity for the customer email.
 - Clear expired checkout recovery OTP challenges.
 - Show the same customer-safe recovery summary shown in checkout:
-  - paid amount when capture payload includes it
+  - paid amount from actual completed PayPal capture evidence; canonical data supplies expected
+    items/destination, and a mismatch shows review-safe copy and blocks fulfillment/retry
   - placed date
   - cart item summary
   - shipping region
@@ -406,7 +422,10 @@ Means only accept OTP rows whose expiry time is still in the future.
 
 ## Next Recommended Implementation Step
 
-If resuming this thread:
+Historical checkout-recovery sequence, retained for reference. For current work, start with
+`SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md`.
+
+If maintaining the existing recovery implementation:
 
 1. Ensure `CheckoutRecoveryOtpChallenge` has `createdAt`.
 2. Run dev migration and generate.

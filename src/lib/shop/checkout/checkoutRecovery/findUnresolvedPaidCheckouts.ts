@@ -16,6 +16,25 @@ const UNRESOLVED_PAID_STATUSES = [
   PAYPAL_LEDGER_STATUS.ERROR,
 ] as const;
 
+const RECOVERY_LEDGER_ROW_SELECT = {
+  orderToken: true,
+  status: true,
+  cartSnapshot: true,
+  shippingSnapshot: true,
+  canonicalOrderSnapshot: true,
+  canonicalOrderSnapshotVersion: true,
+  canonicalOrderSnapshotHash: true,
+  authorizePayload: true,
+  capturePayload: true,
+  receiptLink: true,
+  receiptFile: true,
+  djangoPaymentSaveCustomId: true,
+  lastErrorCode: true,
+  lastErrorMessage: true,
+  createdAt: true,
+  updatedAt: true,
+} satisfies Prisma.PaypalIntentSelect;
+
 async function findUnresolvedPaidCheckoutsByEmailFromLegacyLedger(normalizedEmail: string) {
   const rows = await paypalTxLedger.paypalIntent.findMany({
     where: {
@@ -38,6 +57,7 @@ async function findUnresolvedPaidCheckoutsByEmailFromLegacyLedger(normalizedEmai
       createdAt: 'desc',
     },
     take: 10,
+    select: RECOVERY_LEDGER_ROW_SELECT,
   });
 
   return rows.filter((row) => isCompletedPayPalCapture(row.capturePayload)).slice(0, 3);
@@ -67,6 +87,7 @@ export async function findUnresolvedPaidCheckoutsByEmail(email: string) {
             in: orderTokens,
           },
         },
+        select: RECOVERY_LEDGER_ROW_SELECT,
       });
       const rowByOrderToken = new Map(rows.map((row) => [row.orderToken, row]));
 

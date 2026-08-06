@@ -1,15 +1,23 @@
 # Admin And Recovery Tooling Guide
 
-Last updated: 2026-07-24
+Last updated: 2026-08-06
 
 This guide isolates the admin and checkout recovery work from the broader PayPal TX ledger guide. Use it as the source of truth for the next implementation phase: admin visibility, support recovery, retry operations, and maintenance tooling.
 
 Related source docs:
 
+- `SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md`
 - `PAYPAL_TX_LEDGER_GUIDE.md`
 - `PAYPAL_WEBHOOK_REGISTRATION_AND_RECOVERY_GUIDE.md`
 - `MERCHIZE_FULFILLMENT_OPS_GUIDE.md`
 - `SHOP_CHECKOUT_RECOVERY_IMPLEMENTATION_GUIDE.md`
+
+Release sequencing:
+
+- `SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md` is canonical for public-alpha priority and release gates.
+- This guide remains authoritative for admin authentication, audit, recovery actions, notification
+  recipient management, and operational UI behavior.
+- Older phase lists and "Next Step" sections are domain backlog, not the cross-domain release order.
 
 ## Current Position
 
@@ -268,8 +276,10 @@ The paid-order recovery detail page now exposes these bounded actions:
   readiness for verification. The admin does not re-enter the corrected address. It does not edit
   the address, replay Django, or push the order. Use it only after buyer/authoritative confirmation;
   use **Correct Fulfillment Address** when any field must change.
-- **Regenerate Receipt** rebuilds the receipt from durable payment/cart evidence and the active
-  address correction. The stable object URL remains the same and uses no-store cache policy.
+- **Regenerate Receipt** requires completed capture evidence and a passing canonical
+  authorization-plus-capture chain. It rebuilds new rows from the sealed canonical snapshot and
+  active address correction; `cartSnapshot` is used only for an all-null pre-P0.2 legacy envelope.
+  The stable object URL remains the same and uses no-store cache policy.
 - **Verify and Release** is master-admin-only and requires password step-up, confirmation, and a
   reason. It bypasses only `MERCHIZE_FULFILLMENT_PUSH_ENABLED=false` and the provider's seven-day
   manual-release gate. It cannot bypass invalid address, unavailable/unmapped product, missing
@@ -694,7 +704,8 @@ Each result row should show:
 
 - Support reference.
 - Customer email.
-- Paid amount if available.
+- Paid amount from the actual completed PayPal capture, if available. The canonical total is the
+  expected order value; never label it as paid when capture evidence differs.
 - Current status.
 - Current processing step.
 - Last error code/message summary.
@@ -732,7 +743,8 @@ The detail page should show both a compact support summary and deep debugging da
 Customer-safe summary:
 
 - Support reference.
-- Paid amount.
+- Paid amount from actual completed PayPal capture evidence. A canonical mismatch is payment review,
+  requires admin attention, and disables retry/provider mutation controls.
 - Placed date.
 - Cart item count and first few item names.
 - Shipping city/state/country.
@@ -1185,7 +1197,7 @@ Default table columns:
 
 - Status.
 - Customer.
-- Paid amount.
+- Paid amount (actual completed PayPal capture, never canonical expected total).
 - Current step.
 - Last error.
 - Support reference.
@@ -2014,9 +2026,13 @@ Ledger detail:
 
 Actions:
 
-- Full retry works from `captured`, `receipt_uploaded`, `payment_saved`, and `error`.
+- Full retry works from `captured`, `receipt_uploaded`, and `payment_saved`, and from payment-safe
+  `error` rows only when completed capture evidence and the full canonical
+  authorization-plus-capture chain pass.
 - Fulfillment-only retry requires `djangoPaymentSaveCustomId`.
-- Receipt regeneration uses `cartSnapshot` fallback.
+- Receipt regeneration requires completed capture evidence and the full canonical
+  authorization-plus-capture chain. New rows use the sealed snapshot; `cartSnapshot` is a fallback
+  only for a fully all-null pre-P0.2 legacy envelope.
 - Address override is saved separately from `shippingSnapshot`.
 - Expired OTP cleanup reports deleted count.
 
@@ -2040,6 +2056,9 @@ Security:
 - Raw errors are available to admin, but customer-safe copy is used for customer messages.
 
 ## Next Step
+
+Admin-domain backlog retained for reference. Select work from this list only when the canonical
+`SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md` reaches the corresponding admin P0/P1 slice.
 
 Continue from the current checkpoint:
 

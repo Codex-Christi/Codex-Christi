@@ -28,6 +28,7 @@ import {
   type PayPalRecoveryScannerRunResult,
 } from '@/lib/paypal/txLedger/recoveryScanner';
 import { getPayPalCaptureCompletion } from '@/lib/paypal/txLedger/captureCompletion';
+import { reconcileCanonicalPayPalPaymentChain } from '@/lib/paypal/txLedger/canonicalPaymentReconciliation';
 import {
   PaidFulfillmentProcessingError,
   runPaidFulfillmentProcessing,
@@ -292,6 +293,46 @@ function getProcessingActionFailure(error: unknown, fallback: string) {
   };
 }
 
+function getPaidOrderPaymentGate(row: {
+  authorizePayload: unknown;
+  capturePayload: unknown;
+  canonicalOrderSnapshot: unknown | null;
+  canonicalOrderSnapshotVersion: string | null;
+  canonicalOrderSnapshotHash: string | null;
+}) {
+  const captureCompletion = getPayPalCaptureCompletion(row.capturePayload);
+  if (!captureCompletion.ok) {
+    return {
+      ok: false as const,
+      errorCode: 'PAYPAL_CAPTURE_VALIDATION_FAILED',
+      reason: captureCompletion.reason,
+      stage: 'capture_validation',
+    };
+  }
+
+  const paymentChain = reconcileCanonicalPayPalPaymentChain(
+    row,
+    row.authorizePayload,
+    row.capturePayload,
+  );
+  if (!paymentChain.ok) {
+    return {
+      ok: false as const,
+      errorCode: paymentChain.reconciliation.errorCode,
+      reason: paymentChain.reconciliation.reason,
+      stage: `${paymentChain.failedAt}_validation`,
+    };
+  }
+
+  return { ok: true as const, paymentChain };
+}
+
+function assertPaidOrderPaymentGate(row: Parameters<typeof getPaidOrderPaymentGate>[0]) {
+  const gate = getPaidOrderPaymentGate(row);
+  if (!gate.ok) throw new Error(`Paid-order action is blocked: ${gate.reason}`);
+  return gate;
+}
+
 async function writeMerchizeFulfillmentAdminAction(args: {
   orderToken: string;
   action: string;
@@ -327,7 +368,11 @@ async function writeMerchizeFulfillmentAdminAction(args: {
 async function regeneratePaidOrderReceiptFromLedger(row: {
   orderToken: string;
   authorizePayload: unknown;
+  capturePayload: unknown;
   cartSnapshot: unknown;
+  canonicalOrderSnapshot: unknown | null;
+  canonicalOrderSnapshotVersion: string | null;
+  canonicalOrderSnapshotHash: string | null;
   customerName: string;
   customerEmail: string;
   djangoOrderIntentOrderId: string | null;
@@ -337,9 +382,13 @@ async function regeneratePaidOrderReceiptFromLedger(row: {
     throw new Error('The PayPal authorization snapshot is missing; receipt cannot be regenerated.');
   }
 
+  const paymentGate = assertPaidOrderPaymentGate(row);
+  const canonicalOrderSnapshot = paymentGate.paymentChain.snapshot;
+
   const payload: PaymentReceiptProps = {
     authData: row.authorizePayload as PaymentReceiptProps['authData'],
-    cart: row.cartSnapshot as CartVariant[],
+    cart: canonicalOrderSnapshot ? undefined : (row.cartSnapshot as CartVariant[]),
+    canonicalOrderSnapshot,
     customer: { name: row.customerName, email: row.customerEmail },
     ORD_string: row.djangoOrderIntentOrderId ?? row.orderToken,
     shippingAddressOverride:
@@ -781,7 +830,11 @@ export async function retryAdminPaidOrderRecoveryAction({
       where: { orderToken },
       select: {
         status: true,
+        authorizePayload: true,
         capturePayload: true,
+        canonicalOrderSnapshot: true,
+        canonicalOrderSnapshotVersion: true,
+        canonicalOrderSnapshotHash: true,
         processingCompletedAt: true,
         postProcessingLockExpiresAt: true,
         merchizeFulfillmentResponsePayload: true,
@@ -800,13 +853,9 @@ export async function retryAdminPaidOrderRecoveryAction({
       return reject('This order is already being processed.');
     }
 
-    const captureCompletion = getPayPalCaptureCompletion(existing.capturePayload);
-    if (!captureCompletion.ok) {
-      return reject(
-        captureCompletion.reason,
-        'PAYPAL_CAPTURE_VALIDATION_FAILED',
-        'capture_validation',
-      );
+    const paymentGate = getPaidOrderPaymentGate(existing);
+    if (!paymentGate.ok) {
+      return reject(paymentGate.reason, paymentGate.errorCode, paymentGate.stage);
     }
 
     await runPaidFulfillmentProcessing(orderToken, {
@@ -942,7 +991,11 @@ export async function retryAdminMerchizeFulfillmentAction({
     const existing = await paypalTxLedger.paypalIntent.findUnique({
       where: { orderToken },
       select: {
+        authorizePayload: true,
         capturePayload: true,
+        canonicalOrderSnapshot: true,
+        canonicalOrderSnapshotVersion: true,
+        canonicalOrderSnapshotHash: true,
         djangoPaymentSaveCustomId: true,
         merchizeFulfillmentResponsePayload: true,
         postProcessingLockExpiresAt: true,
@@ -959,6 +1012,10 @@ export async function retryAdminMerchizeFulfillmentAction({
     }
 
     const captureCompletion = getPayPalCaptureCompletion(existing.capturePayload);
+    const paymentGate = getPaidOrderPaymentGate(existing);
+    if (!paymentGate.ok) {
+      return reject(paymentGate.reason, paymentGate.errorCode, paymentGate.stage);
+    }
     const acceptedDjangoHandoff = isAcceptedDjangoFulfillmentProcessResponse(
       existing.merchizeFulfillmentResponsePayload,
     );
@@ -1140,7 +1197,11 @@ export async function releaseMerchizeFulfillmentToProductionAction({
       where: { orderToken },
       select: {
         status: true,
+        authorizePayload: true,
         capturePayload: true,
+        canonicalOrderSnapshot: true,
+        canonicalOrderSnapshotVersion: true,
+        canonicalOrderSnapshotHash: true,
         lastErrorCode: true,
         processingCompletedAt: true,
         postProcessingLockExpiresAt: true,
@@ -1182,9 +1243,9 @@ export async function releaseMerchizeFulfillmentToProductionAction({
       return rejectAfterStepUp('This order is already being processed.');
     }
 
-    const captureCompletion = getPayPalCaptureCompletion(existing.capturePayload);
-    if (!captureCompletion.ok) {
-      return rejectAfterStepUp(captureCompletion.reason);
+    const paymentGate = getPaidOrderPaymentGate(existing);
+    if (!paymentGate.ok) {
+      return rejectAfterStepUp(paymentGate.reason);
     }
 
     await runPaidFulfillmentProcessing(orderToken, {
@@ -1300,6 +1361,11 @@ export async function markPaidOrderFulfillmentAddressValidAction({
     const ledgerOrder = await paypalTxLedger.paypalIntent.findUnique({
       where: { orderToken },
       select: {
+        authorizePayload: true,
+        capturePayload: true,
+        canonicalOrderSnapshot: true,
+        canonicalOrderSnapshotVersion: true,
+        canonicalOrderSnapshotHash: true,
         fulfillmentAddressOverride: true,
         shippingSnapshot: true,
       },
@@ -1307,6 +1373,7 @@ export async function markPaidOrderFulfillmentAddressValidAction({
     if (!ledgerOrder) {
       throw new Error('Recovery row was not found.');
     }
+    assertPaidOrderPaymentGate(ledgerOrder);
 
     const expectedAddress = getMerchizeBuyerAddressExpectationFromLedger(
       ledgerOrder.fulfillmentAddressOverride ?? ledgerOrder.shippingSnapshot,
@@ -1481,6 +1548,8 @@ export async function syncAdminMerchizeProviderDetailsAction({
       where: { orderToken },
       select: {
         orderToken: true,
+        authorizePayload: true,
+        capturePayload: true,
         paypalOrderId: true,
         djangoOrderIntentUuid: true,
         djangoOrderIntentOrderId: true,
@@ -1489,6 +1558,9 @@ export async function syncAdminMerchizeProviderDetailsAction({
         shippingSnapshot: true,
         fulfillmentAddressOverride: true,
         cartSnapshot: true,
+        canonicalOrderSnapshot: true,
+        canonicalOrderSnapshotVersion: true,
+        canonicalOrderSnapshotHash: true,
         merchizeFulfillmentResponsePayload: true,
         merchizeProviderOrderCode: true,
       },
@@ -1500,6 +1572,7 @@ export async function syncAdminMerchizeProviderDetailsAction({
         error: 'Recovery row was not found.',
       };
     }
+    assertPaidOrderPaymentGate(existing);
 
     if (!isAcceptedDjangoFulfillmentProcessResponse(existing.merchizeFulfillmentResponsePayload)) {
       return {
@@ -1542,6 +1615,9 @@ export async function syncAdminMerchizeProviderDetailsAction({
       customerEmail: existing.customerEmail,
       shippingSnapshot: existing.fulfillmentAddressOverride ?? existing.shippingSnapshot,
       cartSnapshot: existing.cartSnapshot,
+      canonicalOrderSnapshot: existing.canonicalOrderSnapshot,
+      canonicalOrderSnapshotVersion: existing.canonicalOrderSnapshotVersion,
+      canonicalOrderSnapshotHash: existing.canonicalOrderSnapshotHash,
     });
 
     if (!registration.ok) {
@@ -1697,7 +1773,11 @@ export async function savePaidOrderFulfillmentAddressOverrideAction({
         orderToken: true,
         paypalOrderId: true,
         authorizePayload: true,
+        capturePayload: true,
         cartSnapshot: true,
+        canonicalOrderSnapshot: true,
+        canonicalOrderSnapshotVersion: true,
+        canonicalOrderSnapshotHash: true,
         customerName: true,
         customerEmail: true,
         djangoOrderIntentUuid: true,
@@ -1711,6 +1791,7 @@ export async function savePaidOrderFulfillmentAddressOverrideAction({
     if (!existing) {
       return { ok: false, error: 'Recovery row was not found.' };
     }
+    assertPaidOrderPaymentGate(existing);
 
     const normalizedAddress = {
       shipping_address_line_1: address.line1.trim(),
@@ -1758,6 +1839,9 @@ export async function savePaidOrderFulfillmentAddressOverrideAction({
       merchizeProviderOrderCode: existing.merchizeProviderOrderCode,
       customerEmail: existing.customerEmail,
       cartSnapshot: existing.cartSnapshot,
+      canonicalOrderSnapshot: existing.canonicalOrderSnapshot,
+      canonicalOrderSnapshotVersion: existing.canonicalOrderSnapshotVersion,
+      canonicalOrderSnapshotHash: existing.canonicalOrderSnapshotHash,
       correctedShippingSnapshot: normalizedAddress,
     });
 
@@ -1937,7 +2021,11 @@ export async function regeneratePaidOrderReceiptAction({
       select: {
         orderToken: true,
         authorizePayload: true,
+        capturePayload: true,
         cartSnapshot: true,
+        canonicalOrderSnapshot: true,
+        canonicalOrderSnapshotVersion: true,
+        canonicalOrderSnapshotHash: true,
         customerName: true,
         customerEmail: true,
         djangoOrderIntentOrderId: true,
