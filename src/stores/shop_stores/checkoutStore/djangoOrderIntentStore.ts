@@ -2,8 +2,7 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { encrypt, decrypt } from '../cartStore';
-import { createEncryptedStorage } from '.';
+import { createCheckoutObfuscatedStorage } from './storage';
 
 interface DjangoOrderIntentState {
   djangoOrderIntentUuid: string;
@@ -35,8 +34,7 @@ export const useDjangoOrderIntentStore = create<DjangoOrderIntentState>()(
       ...initialState,
       setDjangoOrderIntent: (intent) =>
         set((state) => ({
-          djangoOrderIntentUuid:
-            intent.djangoOrderIntentUuid ?? state.djangoOrderIntentUuid,
+          djangoOrderIntentUuid: intent.djangoOrderIntentUuid ?? state.djangoOrderIntentUuid,
           djangoOrderIntentOrderId:
             intent.djangoOrderIntentOrderId ?? state.djangoOrderIntentOrderId,
           djangoOrderIntentPayload:
@@ -56,7 +54,8 @@ export const useDjangoOrderIntentStore = create<DjangoOrderIntentState>()(
     }),
     {
       name: 'django-order-intent-store',
-      storage: createEncryptedStorage<DjangoOrderIntentState>({ encrypt, decrypt }),
+      storage: createCheckoutObfuscatedStorage<DjangoOrderIntentState>('django-order-intent-store'),
+      skipHydration: typeof window === 'undefined',
     },
   ),
 );

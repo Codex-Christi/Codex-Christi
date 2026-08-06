@@ -1,9 +1,9 @@
-import CryptoJS from 'crypto-js';
 import { create } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
+import { persist } from 'zustand/middleware';
 import { PersistedStorageWithRehydration } from '@/lib/types/general_store_interfaces';
 import { fetchUserWishlist, addToWishlist, removeFromWishlist } from '@/lib/funcs/user-wishlist';
 import { getUpdatedKeys } from '@/lib/utils/getUpdatedObjKeys';
+import { createBrowserObfuscatedJSONStorage } from '@/lib/crypto/browserObfuscatedStorage';
 
 interface IWishlist {
   status: number;
@@ -13,25 +13,7 @@ interface IWishlist {
 }
 
 const ENCRYPTION_KEY = process.env.NEXT_PUBLIC_USER_PROFILE_DATA_ENCRYPTION_KEY!;
-
-// === 🔐 Encryption ===
-const encryptData = (data: IWishlist | null): string => {
-  if (!data) return '';
-  const jsonData = JSON.stringify(data);
-  return CryptoJS.AES.encrypt(jsonData, ENCRYPTION_KEY).toString();
-};
-
-// === 🔓 Decryption ===
-const decryptData = (encryptedData: string): IWishlist | null => {
-  if (!encryptedData) return null;
-  try {
-    const bytes = CryptoJS.AES.decrypt(encryptedData, ENCRYPTION_KEY);
-    const decryptedData = bytes.toString(CryptoJS.enc.Utf8);
-    return JSON.parse(decryptedData);
-  } catch {
-    return null;
-  }
-};
+const WISHLIST_STORAGE_NAME = 'user-wishlist';
 
 // ✅ Define the shape of your Zustand store
 interface WishlistStore extends PersistedStorageWithRehydration {
@@ -43,6 +25,13 @@ interface WishlistStore extends PersistedStorageWithRehydration {
   setWishlist: (wishlist: IWishlist | null) => void;
   clearWishlist: () => void;
 }
+
+const wishlistStorage = createBrowserObfuscatedJSONStorage<WishlistStore>({
+  getStorage: () => window.sessionStorage,
+  publicKey: ENCRYPTION_KEY,
+  purpose: WISHLIST_STORAGE_NAME,
+  legacyEncryptedStateFields: ['wishlist'],
+});
 
 export const useWishlist = create<WishlistStore>()(
   persist(
@@ -93,21 +82,9 @@ export const useWishlist = create<WishlistStore>()(
       hydrate: () => set({ _hydrated: true }),
     }),
     {
-      name: 'user-wishlist',
-      storage: createJSONStorage(() => sessionStorage, {
-        replacer: (key, value) => {
-          if (key === 'wishlist' && value && isWishlistData(value as IWishlist)) {
-            return encryptData(value as IWishlist);
-          }
-          return value;
-        },
-        reviver: (key, value) => {
-          if (key === 'wishlist' && typeof value === 'string') {
-            return decryptData(value);
-          }
-          return value;
-        },
-      }),
+      name: WISHLIST_STORAGE_NAME,
+      storage: wishlistStorage,
+      skipHydration: typeof window === 'undefined',
       onRehydrateStorage: () => (state) => {
         state?.hydrate();
       },
@@ -115,23 +92,7 @@ export const useWishlist = create<WishlistStore>()(
   ),
 );
 
-
-export const clearWishlistStorage = () => {
+export const clearWishlistStorage = async () => {
   useWishlist.getState().clearWishlist();
-  useWishlist.persist.clearStorage();
+  await wishlistStorage.removeItem(WISHLIST_STORAGE_NAME);
 };
-
-// ✅ Proper type guard
-function isWishlistData(value: unknown): value is IWishlist {
-  if (
-    typeof value === 'object' &&
-    value !== null &&
-    'status' in value &&
-    'success' in value &&
-    'message' in value &&
-    'data' in value
-  ) {
-    return true;
-  }
-  return false;
-}

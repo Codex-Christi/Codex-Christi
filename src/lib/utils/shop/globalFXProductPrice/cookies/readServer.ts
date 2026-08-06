@@ -1,6 +1,9 @@
 import { cookies } from 'next/headers';
-import { CURRENCY_COOKIE, type CookieStateV1 } from '../cookies/currencyCookie';
-import { decryptCookieJSON } from '@/lib/utils/shop/globalFXProductPrice/crypto/cookieCipher';
+import {
+  CURRENCY_COOKIE,
+  parseCurrencyCookie,
+  type CookieStateV1,
+} from '../cookies/currencyCookie';
 
 const FALLBACK: CookieStateV1 = { v: 1, iso3: 'USA', updatedAt: 0 };
 
@@ -9,11 +12,7 @@ export async function readCurrencyCookieServer(): Promise<CookieStateV1> {
   const raw = jar.get(CURRENCY_COOKIE)?.value;
   if (!raw) return { ...FALLBACK };
 
-  try {
-    const parsed = decryptCookieJSON<CookieStateV1>(raw);
-    if (parsed?.v === 1) return parsed;
-  } catch (e) {
-    console.error('[currency] server cookie decrypt failed', e);
-  }
+  const parsed = parseCurrencyCookie(raw);
+  if (parsed) return parsed;
   return { ...FALLBACK };
 }

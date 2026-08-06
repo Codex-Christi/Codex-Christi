@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import CryptoJS from 'crypto-js';
 import { ProductVariantOptions } from '@/lib/merchizeStorefront/productTypes';
+import { createBrowserObfuscatedJSONStorage } from '@/lib/crypto/browserObfuscatedStorage';
 
 // Types
 export type VariantOption = {
@@ -59,52 +59,9 @@ interface CartState {
   applyMetadataTransform?: (variant: CartVariant) => CartVariant;
 }
 
-// Get encryption key from environment variable
-const SECRET_KEY = process.env.NEXT_PUBLIC_CART_KEY || 'fallback-secret';
-
-// LocalStorage encryption
-export const encrypt = (data: string) => CryptoJS.AES.encrypt(data, SECRET_KEY).toString();
-export const decrypt = (data: string) => {
-  try {
-    const bytes = CryptoJS.AES.decrypt(data, SECRET_KEY);
-    return bytes.toString(CryptoJS.enc.Utf8);
-  } catch {
-    return '[]'; // fallback empty cart
-  }
-};
-
-// Default local storage with encryption
-const encryptedStorage: import('zustand/middleware').PersistStorage<{
-  variants: CartVariant[];
-  offlineOnly: boolean;
-}> = {
-  getItem: (name: string) => {
-    try {
-      const encrypted = localStorage.getItem(name);
-      if (!encrypted) return null;
-      const decrypted = decrypt(encrypted);
-      return JSON.parse(decrypted);
-    } catch {
-      return null;
-    }
-  },
-  setItem: (
-    name: string,
-    value: import('zustand/middleware').StorageValue<{
-      variants: CartVariant[];
-      offlineOnly: boolean;
-    }>,
-  ) => {
-    try {
-      const stringified = JSON.stringify(value);
-      const encrypted = encrypt(stringified);
-      localStorage.setItem(name, encrypted);
-    } catch {
-      // Handle error, maybe fail silently
-    }
-  },
-  removeItem: (name: string) => localStorage.removeItem(name),
-};
+// This key is public in the browser, so persisted cart encryption is obfuscation rather than a
+// security boundary. Web Crypto replaces the discontinued CryptoJS implementation.
+const STORAGE_OBFUSCATION_KEY = process.env.NEXT_PUBLIC_CART_KEY || 'fallback-secret';
 
 export const useCartStore = create<CartState>()(
   persist(
@@ -218,11 +175,19 @@ export const useCartStore = create<CartState>()(
     }),
     {
       name: 'cart-storage',
-      storage: encryptedStorage,
+      storage: createBrowserObfuscatedJSONStorage<{
+        variants: CartVariant[];
+        offlineOnly: boolean;
+      }>({
+        getStorage: () => window.localStorage,
+        publicKey: STORAGE_OBFUSCATION_KEY,
+        purpose: 'cart-storage',
+      }),
       partialize: (state) => ({
         variants: state.variants,
         offlineOnly: state.offlineOnly,
       }),
+      skipHydration: typeof window === 'undefined',
     },
   ),
 );

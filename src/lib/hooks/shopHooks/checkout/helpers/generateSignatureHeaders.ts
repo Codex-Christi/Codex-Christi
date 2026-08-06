@@ -1,6 +1,6 @@
 'use server';
 
-import { HmacSHA256 } from 'crypto-js';
+import { hmacSha256Hex } from '@/lib/crypto/hmacSha256';
 
 export async function generateSignatureHeaders() {
   const API_SECRET_KEY = process.env.SHOP_CHECKOUT_OTP_VERIFICATION_API_KEY;
@@ -10,7 +10,7 @@ export async function generateSignatureHeaders() {
   }
 
   const timestamp = Math.floor(Date.now() / 1000).toString();
-  const signature = HmacSHA256(timestamp, API_SECRET_KEY).toString();
+  const signature = hmacSha256Hex(timestamp, API_SECRET_KEY);
 
   return {
     'Content-Type': 'application/json',

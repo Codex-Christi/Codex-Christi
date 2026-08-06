@@ -77,7 +77,7 @@ export async function savePaymentDataToBackend(encProps: string) {
     finalCapturedOrder,
     canonicalOrderSnapshot,
   } = JSON.parse(
-    decryptForPostProcessingServerAction(encProps),
+    decryptForPostProcessingServerAction(encProps, 'payment-save'),
   ) as PaymentSavingActionProps;
 
   const canonicalAmountReceived = canonicalOrderSnapshot

@@ -120,7 +120,7 @@ function getDjangoFulfillmentFailureMessage(response: OrderProcessingAPIResponse
 
 export const sendMerchizeOrderDetailsToBackend = async (encProps: string) => {
   const { djangoPaymentSaveCustomId, payload } = JSON.parse(
-    decryptForPostProcessingServerAction(encProps),
+    decryptForPostProcessingServerAction(encProps, 'fulfillment'),
   ) as MerchizeFulfillmentProcessProps;
 
   if (!djangoPaymentSaveCustomId) {

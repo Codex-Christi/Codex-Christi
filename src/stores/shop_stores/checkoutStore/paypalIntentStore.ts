@@ -1,8 +1,7 @@
 'use client';
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { createEncryptedStorage } from '.';
-import { decrypt, encrypt } from '../cartStore';
+import { createCheckoutObfuscatedStorage } from './storage';
 
 export type ActivePayPalCheckoutStage =
   | 'paypal_order_created'
@@ -102,11 +101,12 @@ export const usePayPalIntentStore = create<PayPalIntentState>()(
     }),
     {
       name: 'paypal-intent-store',
-      storage: createEncryptedStorage<PayPalIntentPersistedState>({ encrypt, decrypt }),
+      storage: createCheckoutObfuscatedStorage<PayPalIntentPersistedState>('paypal-intent-store'),
       partialize: (state): PayPalIntentPersistedState => ({
         orderToken: state.orderToken,
         activeCheckout: state.activeCheckout,
       }),
+      skipHydration: typeof window === 'undefined',
     },
   ),
 );

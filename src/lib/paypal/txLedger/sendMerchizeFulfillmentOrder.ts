@@ -257,7 +257,7 @@ export async function sendMerchizeFulfillmentOrder(args: MerchizeFulfillmentOrde
   } satisfies MerchizeFulfillmentProcessProps;
 
   const response = await sendMerchizeOrderDetailsToBackend(
-    encryptForPostProcessingServerAction(JSON.stringify(payload)),
+    encryptForPostProcessingServerAction(JSON.stringify(payload), 'fulfillment'),
   );
 
   if (!response.ok) {

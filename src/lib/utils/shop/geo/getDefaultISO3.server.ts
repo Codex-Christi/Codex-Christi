@@ -1,7 +1,9 @@
 import { cookies, headers } from 'next/headers';
 import { fetchUserShopProfile } from '@/lib/funcs/user-shop';
-import { CURRENCY_COOKIE } from '../globalFXProductPrice/cookies/currencyCookie';
-import { decryptCookieJSON } from '@/lib/utils/shop/globalFXProductPrice/crypto/cookieCipher';
+import {
+  CURRENCY_COOKIE,
+  parseCurrencyCookie,
+} from '../globalFXProductPrice/cookies/currencyCookie';
 import { normalizeCountryToIso3 } from '../checkout/normalizeCountryToIso3';
 
 type GetDefaultISO3Options = {
@@ -18,10 +20,8 @@ async function getCurrencyCookieISO3() {
   const jar = cookies();
   const raw = (await jar).get(CURRENCY_COOKIE)?.value;
   if (raw) {
-    try {
-      const parsed = decryptCookieJSON<{ iso3?: string }>(raw);
-      if (parsed?.iso3) return parsed.iso3.toUpperCase();
-    } catch {}
+    const parsed = parseCurrencyCookie(raw);
+    if (parsed?.iso3) return parsed.iso3;
   }
 
   return null;

@@ -1,10 +1,10 @@
 // src/stores/userMainProfileStore.ts
 import { create } from 'zustand';
-import { persist, createJSONStorage, type StateStorage } from 'zustand/middleware';
-import CryptoJS from 'crypto-js';
+import { persist } from 'zustand/middleware';
 import { UserProfileDataInterface } from '@/lib/types/user-profile/main-user-profile';
 import { getUser } from '@/lib/funcs/userProfileFetchers/getUser';
 import { getUpdatedKeys } from '@/lib/utils/getUpdatedObjKeys';
+import { createBrowserObfuscatedJSONStorage } from '@/lib/crypto/browserObfuscatedStorage';
 
 // Prevent multiple simultaneous fetches from the server (but allow future refreshes)
 let inFlightUserProfilePromise: Promise<UserProfileDataInterface | null> | null = null;
@@ -28,67 +28,7 @@ const fetchUserProfileOnce = async (): Promise<UserProfileDataInterface | null> 
 };
 
 const ENCRYPTION_KEY = process.env.NEXT_PUBLIC_USER_PROFILE_DATA_ENCRYPTION_KEY!;
-
-// === 🔐 Encryption ===
-export const encrypt = (data: string) => CryptoJS.AES.encrypt(data, ENCRYPTION_KEY).toString();
-export const decrypt = (data: string) => {
-  try {
-    const bytes = CryptoJS.AES.decrypt(data, ENCRYPTION_KEY);
-    return bytes.toString(CryptoJS.enc.Utf8);
-  } catch {
-    // For this store we persist an object (or null), so JSON-safe fallback should be `null`.
-    return 'null';
-  }
-};
-
-/**
- * Encrypted JSON storage for zustand persist.
- * Uses localStorage by default (persists across browser restarts) and falls back to a no-op storage during SSR.
- */
-const createEncryptedStorage = <S>(opts: {
-  encrypt: (plain: string) => string;
-  decrypt: (cipher: string) => string;
-  storage?: Storage;
-}) => {
-  const noop: StateStorage = {
-    getItem: () => null,
-    setItem: () => {},
-    removeItem: () => {},
-  };
-
-  return createJSONStorage<S>(() => {
-    const base: Storage | null =
-      opts.storage ?? (typeof window !== 'undefined' ? window.localStorage : null);
-
-    if (!base) return noop;
-
-    return {
-      getItem: (name) => {
-        const raw = base.getItem(name);
-        if (!raw) return null;
-        try {
-          return opts.decrypt(raw);
-        } catch {
-          return null;
-        }
-      },
-      setItem: (name, value) => {
-        try {
-          base.setItem(name, opts.encrypt(value));
-        } catch {
-          // ignore write failures (quota, disabled storage, etc.)
-        }
-      },
-      removeItem: (name) => {
-        try {
-          base.removeItem(name);
-        } catch {
-          // ignore
-        }
-      },
-    } as StateStorage;
-  });
-};
+const USER_MAIN_PROFILE_STORAGE_NAME = 'user-main-profile-storage';
 
 interface UserMainProfileStore {
   userMainProfile: UserProfileDataInterface | null;
@@ -97,7 +37,13 @@ interface UserMainProfileStore {
   setProfileFromServer: () => Promise<void>;
 }
 
-// This store persists the user profile data in localStorage and encrypts it.
+const userMainProfileStorage = createBrowserObfuscatedJSONStorage<UserMainProfileStore>({
+  getStorage: () => window.localStorage,
+  publicKey: ENCRYPTION_KEY,
+  purpose: USER_MAIN_PROFILE_STORAGE_NAME,
+});
+
+// This store persists the user profile data in obfuscated localStorage.
 export const useUserMainProfileStore = create<UserMainProfileStore>()(
   persist(
     (set, get) => ({
@@ -129,15 +75,40 @@ export const useUserMainProfileStore = create<UserMainProfileStore>()(
       clearProfile: () => set({ userMainProfile: null }),
     }),
     {
-      name: 'user-main-profile-storage',
-      storage: createEncryptedStorage<UserMainProfileStore>({ encrypt, decrypt }),
-      // Skip initial hydration on the server; we'll trigger rehydrate on the client.
+      name: USER_MAIN_PROFILE_STORAGE_NAME,
+      storage: userMainProfileStorage,
+      skipHydration: typeof window === 'undefined',
     },
   ),
 );
 
-export const clearUserMainProfileStore = () => {
+let userMainProfileHydrationPromise: Promise<void> | null = null;
+
+export function waitForUserMainProfileStoreHydration(): Promise<void> {
+  if (typeof window === 'undefined' || useUserMainProfileStore.persist.hasHydrated()) {
+    return Promise.resolve();
+  }
+
+  if (!userMainProfileHydrationPromise) {
+    userMainProfileHydrationPromise = new Promise<void>((resolve) => {
+      let unsubscribe = () => {};
+      const finish = () => {
+        unsubscribe();
+        resolve();
+      };
+
+      unsubscribe = useUserMainProfileStore.persist.onFinishHydration(finish);
+      if (useUserMainProfileStore.persist.hasHydrated()) finish();
+    }).finally(() => {
+      userMainProfileHydrationPromise = null;
+    });
+  }
+
+  return userMainProfileHydrationPromise;
+}
+
+export const clearUserMainProfileStore = async () => {
   const { clearProfile } = useUserMainProfileStore.getState();
   clearProfile();
-  useUserMainProfileStore.persist.clearStorage();
+  await userMainProfileStorage.removeItem(USER_MAIN_PROFILE_STORAGE_NAME);
 };

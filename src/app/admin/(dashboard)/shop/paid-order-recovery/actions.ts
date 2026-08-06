@@ -395,7 +395,7 @@ async function regeneratePaidOrderReceiptFromLedger(row: {
       (row.fulfillmentAddressOverride as PaymentReceiptProps['shippingAddressOverride']) ?? null,
   };
   const result = await savePaymentReceiptToCloud(
-    encryptForPostProcessingServerAction(JSON.stringify(payload)),
+    encryptForPostProcessingServerAction(JSON.stringify(payload), 'receipt'),
   );
 
   if (!result.success || !('pdfReceiptLink' in result) || !('receiptFileName' in result)) {

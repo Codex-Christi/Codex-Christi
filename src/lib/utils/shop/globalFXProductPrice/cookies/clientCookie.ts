@@ -1,16 +1,12 @@
 'use client';
 
 import Cookies from 'js-cookie';
-import { CURRENCY_COOKIE, type CookieStateV1 } from '../cookies/currencyCookie';
-
-function parseCurrencyCookie(raw: string): CookieStateV1 | null {
-  try {
-    const parsed = JSON.parse(raw) as CookieStateV1;
-    return parsed?.v === 1 ? parsed : null;
-  } catch {
-    return null;
-  }
-}
+import {
+  CURRENCY_COOKIE,
+  parseCurrencyCookie,
+  serializeCurrencyCookie,
+  type CookieStateV1,
+} from '../cookies/currencyCookie';
 
 export function readCurrencyCookieClient(): CookieStateV1 | null {
   try {
@@ -24,7 +20,7 @@ export function readCurrencyCookieClient(): CookieStateV1 | null {
 
 export function writeCurrencyCookieClient(state: CookieStateV1): void {
   try {
-    Cookies.set(CURRENCY_COOKIE, JSON.stringify(state), {
+    Cookies.set(CURRENCY_COOKIE, serializeCurrencyCookie(state), {
       sameSite: 'lax',
       expires: 30,
       path: '/',

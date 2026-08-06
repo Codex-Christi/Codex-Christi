@@ -366,7 +366,8 @@ PAYPAL_TX_LEDGER_NEON_DB_STRING="postgresql://USER:PASSWORD@HOST/PROD_DB?sslmode
 PAYPAL_TX_LEDGER_NEON_POOLED_DB_DEV_STRING="postgresql://USER:PASSWORD@HOST/DEV_DB?sslmode=require"
 PAYPAL_TX_LEDGER_NEON_POOLED_DB_STRING="postgresql://USER:PASSWORD@HOST/PROD_DB?sslmode=require"
 
-SHOP_SERVER_ACTIONS_CRYPTO_SECRET="long-random-secret"
+# Checkout post-processing AES-GCM secret (server-only)
+SHOP_CHECKOUT_SERVER_ACTIONS_POST_PROCESSING_CRYPTO_SECRET="long-random-secret"
 
 # Internal alert fallback recipients
 # Primary paid-order routing now reads Admin Ops `AdminNotificationRecipientGroup`
@@ -2249,28 +2250,40 @@ P0.2 adds a mandatory order-integrity gate before these side effects:
 
 **Important: server-only crypto**
 
-The existing `encrypt` helper currently lives in `@/stores/shop_stores/cartStore`, which is a `'use client'` file and depends on a public env var. Do **not** reuse that helper from webhook/server code.
+The legacy `encrypt` helper lived in `@/stores/shop_stores/cartStore`, which is client-side and
+depends on a public env var. Do **not** recreate or reuse that pattern in webhook/server code.
 
 Keep two helpers:
 
-- client-side checkout encryption can stay on its current path until you refactor the OTP flow
-- webhook/post-processing must use a server-only helper backed by `SHOP_SERVER_ACTIONS_CRYPTO_SECRET`
+- client-side persisted-state obfuscation uses the native Web Crypto adapter
+- webhook/post-processing uses a server-only AES-GCM helper backed by
+  `SHOP_CHECKOUT_SERVER_ACTIONS_POST_PROCESSING_CRYPTO_SECRET`
 
 ```ts
 // src/lib/utils/shop/checkout/serverPostProcessingCrypto.ts
 import 'server-only';
-import CryptoJS from 'crypto-js';
+import { encryptServerText } from '@/lib/crypto/serverAesGcm';
+
+type PostProcessingCipherPurpose = 'receipt' | 'payment-save' | 'fulfillment';
 
 function getServerActionSecret() {
-  const secret = process.env.SHOP_SERVER_ACTIONS_CRYPTO_SECRET;
+  const secret = process.env.SHOP_CHECKOUT_SERVER_ACTIONS_POST_PROCESSING_CRYPTO_SECRET;
   if (!secret) {
-    throw new Error('SHOP_SERVER_ACTIONS_CRYPTO_SECRET is not configured');
+    throw new Error(
+      'SHOP_CHECKOUT_SERVER_ACTIONS_POST_PROCESSING_CRYPTO_SECRET is not configured',
+    );
   }
   return secret;
 }
 
-export function encryptForPostProcessingServerAction(text: string): string {
-  return CryptoJS.AES.encrypt(text, getServerActionSecret()).toString();
+export function encryptForPostProcessingServerAction(
+  text: string,
+  purpose: PostProcessingCipherPurpose,
+): string {
+  return encryptServerText(text, {
+    secret: getServerActionSecret(),
+    purpose: `checkout-post-processing/${purpose}`,
+  });
 }
 ```
 
@@ -2338,6 +2351,7 @@ export async function runPaidFulfillmentProcessing(orderToken: string) {
     if (!row.receiptLink || !row.receiptFile) {
       const receiptPayload = encryptForPostProcessingServerAction(
         JSON.stringify({ authData, customer, ORD_string }),
+        'receipt',
       );
       const receiptRes = await savePaymentReceiptToCloud(receiptPayload);
       if (!receiptRes.success) {
@@ -2373,6 +2387,7 @@ export async function runPaidFulfillmentProcessing(orderToken: string) {
           pdfReceiptLink: row.receiptLink,
           receiptFileName: row.receiptFile,
         }),
+        'payment-save',
       );
 
       const paymentSave = await savePaymentDataToBackend(savePayload);
@@ -2525,6 +2540,7 @@ export async function sendMerchizeFulfillmentOrder(args: MerchizeFulfillmentOrde
         djangoPaymentSaveCustomId: args.djangoPaymentSaveCustomId,
         payload: requestPayload,
       }),
+      'fulfillment',
     ),
   );
 

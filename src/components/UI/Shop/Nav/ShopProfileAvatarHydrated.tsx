@@ -4,7 +4,10 @@ import { useEffect } from 'react';
 import type { ImageProps } from 'next/image';
 import MainProfileAvatar from '../../profile/UserAvatar';
 import { useAuthStore } from '@/stores/authStore';
-import { useUserMainProfileStore } from '@/stores/userMainProfileStore';
+import {
+  useUserMainProfileStore,
+  waitForUserMainProfileStoreHydration,
+} from '@/stores/userMainProfileStore';
 
 type ShopProfileAvatarHydratedProps = Omit<ImageProps, 'src'> & {
   width: number;
@@ -25,7 +28,7 @@ export default function ShopProfileAvatarHydrated({
     let cancelled = false;
 
     const syncProfile = async () => {
-      useUserMainProfileStore.persist.rehydrate();
+      await waitForUserMainProfileStoreHydration();
 
       const session = isAuthenticated
         ? { isAuthenticated: true }

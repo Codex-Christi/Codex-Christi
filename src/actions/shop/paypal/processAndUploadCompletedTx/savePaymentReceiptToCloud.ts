@@ -35,7 +35,7 @@ export const savePaymentReceiptToCloud = async (encodedProps: string) => {
       ORD_string,
       shippingAddressOverride,
     } = JSON.parse(
-      decryptForPostProcessingServerAction(encodedProps),
+      decryptForPostProcessingServerAction(encodedProps, 'receipt'),
     ) as PaymentReceiptProps;
     const { email: customerEmail, name: customerName } = customer || {};
 

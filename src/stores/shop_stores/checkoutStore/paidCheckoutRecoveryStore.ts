@@ -2,8 +2,7 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { createEncryptedStorage } from '.';
-import { decrypt, encrypt } from '../cartStore';
+import { createCheckoutObfuscatedStorage } from './storage';
 
 const PAID_CHECKOUT_RECOVERY_SESSION_TTL_MS = 15 * 60 * 1000;
 
@@ -74,7 +73,10 @@ export const usePaidCheckoutRecoveryStore = create<PaidCheckoutRecoveryStore>()(
     }),
     {
       name: 'paid-checkout-recovery-store',
-      storage: createEncryptedStorage<PaidCheckoutRecoveryStore>({ encrypt, decrypt }),
+      storage: createCheckoutObfuscatedStorage<PaidCheckoutRecoveryStore>(
+        'paid-checkout-recovery-store',
+      ),
+      skipHydration: typeof window === 'undefined',
     },
   ),
 );

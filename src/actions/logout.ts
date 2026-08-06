@@ -16,7 +16,7 @@ export const logoutUser = async (): Promise<boolean | LogoutResult> => {
   });
 
   try {
-    clearUserMainProfileStore();
+    await clearUserMainProfileStore();
     toast.dismiss(loadingToastID);
     window.location.assign('/next-api/logout');
 
@@ -24,9 +24,8 @@ export const logoutUser = async (): Promise<boolean | LogoutResult> => {
   } catch (err: unknown) {
     toast.dismiss(loadingToastID);
 
-    const apiErrorMessage = err instanceof Error
-      ? err.message
-      : 'Something went wrong. Please try again.';
+    const apiErrorMessage =
+      err instanceof Error ? err.message : 'Something went wrong. Please try again.';
 
     errorToast({
       message: apiErrorMessage,

@@ -2,7 +2,7 @@
 'use client';
 
 import { useEffect } from 'react';
-import { useUserMainProfileStore } from '@/stores/userMainProfileStore';
+import { waitForUserMainProfileStoreHydration } from '@/stores/userMainProfileStore';
 
 /**
  * This component is mounted high in the tree (e.g. in app/layout.tsx).
@@ -10,8 +10,7 @@ import { useUserMainProfileStore } from '@/stores/userMainProfileStore';
  */
 export default function UserMainProfileStoreInitializer() {
   useEffect(() => {
-    // Hydrate from sessionStorage on client mount
-    useUserMainProfileStore.persist.rehydrate();
+    void waitForUserMainProfileStoreHydration();
   }, []);
 
   return null;

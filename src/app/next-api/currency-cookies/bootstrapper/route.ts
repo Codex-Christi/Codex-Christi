@@ -1,7 +1,11 @@
 import { NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
-import { CURRENCY_COOKIE, type CookieStateV1 } from '@/lib/utils/shop/globalFXProductPrice/cookies/currencyCookie';
-import { encryptCookieJSON } from '@/lib/utils/shop/globalFXProductPrice/crypto/cookieCipher';
+import {
+  CURRENCY_COOKIE,
+  parseCurrencyCookie,
+  serializeCurrencyCookie,
+  type CookieStateV1,
+} from '@/lib/utils/shop/globalFXProductPrice/cookies/currencyCookie';
 import { normalizeCountryToIso3 } from '@/lib/utils/shop/checkout/normalizeCountryToIso3';
 
 type BootstrapBody = {
@@ -12,7 +16,8 @@ type BootstrapBody = {
 
 export async function POST(request: Request) {
   const jar = await cookies();
-  if (jar.get(CURRENCY_COOKIE)?.value) {
+  const existing = jar.get(CURRENCY_COOKIE)?.value;
+  if (existing && parseCurrencyCookie(existing)) {
     return NextResponse.json({ ok: true, skipped: true });
   }
 
@@ -31,7 +36,7 @@ export async function POST(request: Request) {
   };
 
   const response = NextResponse.json({ ok: true });
-  response.cookies.set(CURRENCY_COOKIE, encryptCookieJSON(payload), {
+  response.cookies.set(CURRENCY_COOKIE, serializeCurrencyCookie(payload), {
     sameSite: 'lax',
     secure: process.env.NODE_ENV === 'production',
     httpOnly: false,

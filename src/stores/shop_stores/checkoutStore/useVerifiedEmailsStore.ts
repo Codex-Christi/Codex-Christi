@@ -1,8 +1,7 @@
 // verifiedEmailsStore.ts
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { createEncryptedStorage } from '.';
-import { decrypt, encrypt } from '../cartStore';
+import { createCheckoutObfuscatedStorage } from './storage';
 
 interface VerifiedEmailsState {
   verifiedEmailsList: Record<string, boolean>;
@@ -24,7 +23,8 @@ export const useVerifiedEmailsStore = create<VerifiedEmailsState>()(
     }),
     {
       name: 'verifiedEmailsList-emails',
-      storage: createEncryptedStorage<VerifiedEmailsState>({ encrypt, decrypt }),
+      storage: createCheckoutObfuscatedStorage<VerifiedEmailsState>('verifiedEmailsList-emails'),
+      skipHydration: typeof window === 'undefined',
     },
   ),
 );

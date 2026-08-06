@@ -2,9 +2,10 @@
 
 import Cookies from 'js-cookie';
 import { countries } from 'country-data-list';
-import { CURRENCY_COOKIE } from '../globalFXProductPrice/cookies/currencyCookie';
-// If you encrypt, swap JSON.parse for your decryptCookieJSON
-// import { decryptCookieJSON } from "@/lib/utils/shop/globalFXProductPrice/crypto/cookieCipherClient";
+import {
+  CURRENCY_COOKIE,
+  parseCurrencyCookie,
+} from '../globalFXProductPrice/cookies/currencyCookie';
 
 function iso2ToIso3(iso2: string): string | null {
   const hit = countries.all.find((c) => c.alpha2?.toUpperCase() === iso2.toUpperCase());
@@ -22,9 +23,8 @@ export function getDefaultISO3(): string {
   try {
     const raw = Cookies.get(CURRENCY_COOKIE);
     if (raw) {
-      // const parsed = decryptCookieJSON<{ iso3?: string }>(raw);
-      const parsed = JSON.parse(raw);
-      if (parsed?.iso3) return parsed.iso3.toUpperCase();
+      const parsed = parseCurrencyCookie(raw);
+      if (parsed?.iso3) return parsed.iso3;
     }
   } catch {}
 

@@ -162,11 +162,11 @@ function toPaidFulfillmentProcessingError(error: unknown, stage: PaidFulfillment
 }
 
 function buildPaymentReceiptPayload(args: PaymentReceiptProps) {
-  return encryptForPostProcessingServerAction(JSON.stringify(args));
+  return encryptForPostProcessingServerAction(JSON.stringify(args), 'receipt');
 }
 
 function buildPaymentSavePayload(args: PaymentSavingActionProps) {
-  return encryptForPostProcessingServerAction(JSON.stringify(args));
+  return encryptForPostProcessingServerAction(JSON.stringify(args), 'payment-save');
 }
 
 function toLedgerJson(value: unknown) {
