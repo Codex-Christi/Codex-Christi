@@ -1,6 +1,7 @@
 // src/lib/datasetSearchers/merchize/catalog.ts
 import { merchizeCatalogPrisma } from '@/lib/prisma/shop/merchize/merchizeCatalogPrisma';
 import type {
+  Prisma,
   Product,
   Variant,
   ShippingBand,
@@ -51,6 +52,91 @@ export class MissingMerchizeCatalogSkuError extends Error {
     this.missingSkus = missingSkus;
     Object.setPrototypeOf(this, new.target.prototype);
   }
+}
+
+export class CurrentMerchizeCatalogGenerationUnavailableError extends Error {
+  readonly code = 'CURRENT_MERCHIZE_CATALOG_GENERATION_UNAVAILABLE' as const;
+
+  constructor() {
+    super('A complete current Merchize catalog generation is unavailable.');
+    this.name = 'CurrentMerchizeCatalogGenerationUnavailableError';
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export type CurrentCatalogVariantLookup = {
+  generationAvailable: boolean;
+  variant: StrictCatalogVariantRecord | null;
+};
+
+export type CurrentCatalogVariantBatchLookup = {
+  generationAvailable: boolean;
+  variants: StrictCatalogVariantRecord[];
+};
+
+export const DEFAULT_MERCHIZE_CATALOG_CURRENT_MAX_AGE_HOURS = 48;
+
+function configuredCatalogCurrentMaxAgeMs() {
+  const raw = process.env.MERCHIZE_CATALOG_CURRENT_MAX_AGE_HOURS?.trim();
+  const configured = raw ? Number(raw) : Number.NaN;
+  const hours = Number.isFinite(configured)
+    ? Math.min(Math.max(configured, 1), 24 * 14)
+    : DEFAULT_MERCHIZE_CATALOG_CURRENT_MAX_AGE_HOURS;
+  return hours * 60 * 60 * 1_000;
+}
+
+export function isMerchizeCatalogGenerationCurrent(
+  generation: {
+    lastCompletedRunId: string | null;
+    lastCompletedAt: Date | null;
+    activeRunId?: string | null;
+  } | null,
+  now = new Date(),
+  maxAgeMs = configuredCatalogCurrentMaxAgeMs(),
+) {
+  const runId = generation?.lastCompletedRunId?.trim();
+  const completedAt = generation?.lastCompletedAt;
+  if (!runId || !completedAt || generation?.activeRunId?.trim()) return false;
+  const ageMs = now.getTime() - completedAt.getTime();
+  return ageMs >= 0 && ageMs <= maxAgeMs;
+}
+
+type CatalogGenerationRow = {
+  catalogCurrent: boolean;
+  catalogLastSeenRunId: string | null;
+};
+
+/**
+ * `catalogCurrent` alone is insufficient: an expired writer can resume after a newer generation
+ * commits. A row is authoritative only when both it and its parent were written by the exact
+ * generation named by SyncState.
+ */
+export function isCatalogRowInCompletedGeneration(
+  variant: CatalogGenerationRow,
+  product: CatalogGenerationRow | null,
+  completedRunId: string,
+) {
+  return (
+    variant.catalogCurrent === true &&
+    variant.catalogLastSeenRunId === completedRunId &&
+    product?.catalogCurrent === true &&
+    product.catalogLastSeenRunId === completedRunId
+  );
+}
+
+export function buildStrictCatalogGenerationWhere(
+  skus: string[],
+  completedRunId: string,
+): Prisma.VariantWhereInput {
+  return {
+    sku: { in: skus },
+    catalogCurrent: true,
+    catalogLastSeenRunId: completedRunId,
+    product: {
+      catalogCurrent: true,
+      catalogLastSeenRunId: completedRunId,
+    },
+  };
 }
 
 // Helper to pick a band by zone ("US", "EU", "GB", ...)
@@ -172,11 +258,24 @@ export async function getStrictCatalogVariantsBySku(
   const uniqueSkus = [...new Set(skus.map((sku) => sku.trim()).filter(Boolean))].sort();
   if (!uniqueSkus.length) return [];
 
+  const completedGeneration = await getCurrentCompletedCatalogGeneration();
+  if (!completedGeneration) {
+    throw new CurrentMerchizeCatalogGenerationUnavailableError();
+  }
+  const completedRunId = completedGeneration.lastCompletedRunId!.trim();
+
   const variants = await merchizeCatalogPrisma.variant.findMany({
-    where: { sku: { in: uniqueSkus } },
+    where: buildStrictCatalogGenerationWhere(uniqueSkus, completedRunId),
     include: { product: true, shippingBands: true },
   });
-  const bySku = new Map(variants.map((variant) => [variant.sku, variant]));
+  const currentVariants = variants.filter((variant) =>
+    isCatalogRowInCompletedGeneration(variant, variant.product, completedRunId),
+  );
+  const confirmedGeneration = await getCurrentCompletedCatalogGeneration();
+  if (confirmedGeneration?.lastCompletedRunId?.trim() !== completedRunId) {
+    throw new CurrentMerchizeCatalogGenerationUnavailableError();
+  }
+  const bySku = new Map(currentVariants.map((variant) => [variant.sku, variant]));
   const missingSkus = uniqueSkus.filter((sku) => !bySku.has(sku));
   if (missingSkus.length) throw new MissingMerchizeCatalogSkuError(missingSkus);
 
@@ -193,4 +292,66 @@ export async function getStrictCatalogVariantsBySku(
       catalogRow: toCatalogItemFromDb(variant),
     };
   });
+}
+
+async function getCurrentCompletedCatalogGeneration() {
+  const syncState = await merchizeCatalogPrisma.syncState.findUnique({
+    where: { id: 'merchize_catalog' },
+    select: { lastCompletedRunId: true, lastCompletedAt: true, activeRunId: true },
+  });
+
+  return isMerchizeCatalogGenerationCurrent(syncState) ? syncState : null;
+}
+
+/**
+ * Missing-Product storefront variants can be sold only when their SKU is present in the latest
+ * complete catalog generation. Historical upsert-only rows never count as positive evidence.
+ */
+export async function getCurrentCatalogVariantBySku(
+  rawSku: string,
+): Promise<CurrentCatalogVariantLookup> {
+  const sku = rawSku.trim();
+  const batch = await getCurrentCatalogVariantsBySku(sku ? [sku] : []);
+  return {
+    generationAvailable: batch.generationAvailable,
+    variant: batch.variants[0] ?? null,
+  };
+}
+
+export async function getCurrentCatalogVariantsBySku(
+  rawSkus: string[],
+): Promise<CurrentCatalogVariantBatchLookup> {
+  const skus = [...new Set(rawSkus.map((sku) => sku.trim()).filter(Boolean))].sort();
+  const completedGeneration = await getCurrentCompletedCatalogGeneration();
+  if (!completedGeneration) return { generationAvailable: false, variants: [] };
+  if (!skus.length) return { generationAvailable: true, variants: [] };
+  const completedRunId = completedGeneration.lastCompletedRunId!.trim();
+
+  const rows = await merchizeCatalogPrisma.variant.findMany({
+    where: buildStrictCatalogGenerationWhere(skus, completedRunId),
+    include: { product: true, shippingBands: true },
+  });
+  const variants = rows
+    .filter(
+      (variant) =>
+        isCatalogRowInCompletedGeneration(variant, variant.product, completedRunId) &&
+        !!variant.product.merchizeId &&
+        !!variant.merchizeId,
+    )
+    .map((variant) => ({
+      sku: variant.sku,
+      supplierProductId: variant.product!.merchizeId,
+      supplierVariantId: variant.merchizeId,
+      catalogRow: toCatalogItemFromDb(variant),
+    }));
+
+  const confirmedGeneration = await getCurrentCompletedCatalogGeneration();
+  if (confirmedGeneration?.lastCompletedRunId?.trim() !== completedRunId) {
+    return { generationAvailable: false, variants: [] };
+  }
+
+  return {
+    generationAvailable: true,
+    variants,
+  };
 }

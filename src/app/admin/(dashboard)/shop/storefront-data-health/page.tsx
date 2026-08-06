@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import StorefrontDataHealthAdminClient from './StorefrontDataHealthAdminClient';
 import { getStorefrontSnapshotStats } from './actions';
+import { getVariantPublicationIssueSummary } from './variantPublicationIssuesData';
 import { merchizeCatalogPrisma } from '@/lib/prisma/shop/merchize/merchizeCatalogPrisma';
 import { requireAdminPage } from '@/lib/admin/require-admin';
 
@@ -14,7 +15,12 @@ export const dynamic = 'force-dynamic';
 
 async function getStorefrontDataHealthPageData() {
   try {
-    const [syncState, sampleVariants, storefrontSnapshotStats] = await Promise.all([
+    const [
+      syncState,
+      sampleVariants,
+      storefrontSnapshotStats,
+      variantPublicationIssueSummary,
+    ] = await Promise.all([
       merchizeCatalogPrisma.syncState.findUnique({
         where: { id: 'merchize_catalog' },
       }),
@@ -24,9 +30,15 @@ async function getStorefrontDataHealthPageData() {
         orderBy: { createdAt: 'desc' },
       }),
       getStorefrontSnapshotStats(),
+      getVariantPublicationIssueSummary(),
     ]);
 
-    return { syncState, sampleVariants, storefrontSnapshotStats };
+    return {
+      syncState,
+      sampleVariants,
+      storefrontSnapshotStats,
+      variantPublicationIssueSummary,
+    };
   } catch (error) {
     console.error('Failed to fetch storefront data health:', error);
     return null;
@@ -48,6 +60,7 @@ export default async function StorefrontDataHealthAdminPage() {
           initialSyncState={pageData.syncState}
           initialSamples={pageData.sampleVariants}
           initialStorefrontSnapshotStats={pageData.storefrontSnapshotStats}
+          initialVariantPublicationIssueSummary={pageData.variantPublicationIssueSummary}
         />
       ) : (
         <div className='grid min-h-[60dvh] place-items-center px-4 text-white'>

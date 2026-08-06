@@ -8,11 +8,13 @@ import { FaAngleRight } from 'react-icons/fa6';
 import CustomShopLink from '../../HelperComponents/CustomShopLink';
 import { useShopCheckoutStore } from '@/stores/shop_stores/checkoutStore';
 import GlobalProductPrice from '../../GlobalShopComponents/GlobalProductPrice';
+import { Button } from '@/components/UI/primitives/button';
 
 type OrderSummaryProps = {
   /** ISO-3 destination country code, e.g. 'USA', 'GBR', 'CAN'. Defaults to 'USA'. */
   countryIso3?: string;
   cartItemsOverride?: CartVariant[];
+  checkoutBlocked?: boolean;
 };
 
 type ShippingEstimate = {
@@ -21,7 +23,11 @@ type ShippingEstimate = {
 };
 
 // Main Component
-const OrderSummary: FC<OrderSummaryProps> = ({ countryIso3 = 'USA', cartItemsOverride }) => {
+const OrderSummary: FC<OrderSummaryProps> = ({
+  countryIso3 = 'USA',
+  cartItemsOverride,
+  checkoutBlocked = false,
+}) => {
   // Hooks
   const { variants: storeCartItems } = useCartStore();
   const cartItems = cartItemsOverride ?? storeCartItems;
@@ -39,7 +45,7 @@ const OrderSummary: FC<OrderSummaryProps> = ({ countryIso3 = 'USA', cartItemsOve
 
   //   Funcs
   const getShippingEstimates = useCallback(async () => {
-    if (!cartItems.length) return null;
+    if (!cartItems.length || checkoutBlocked) return null;
 
     try {
       const res = await fetch('/next-api/shop/cart/shipping-estimate', {
@@ -74,7 +80,7 @@ const OrderSummary: FC<OrderSummaryProps> = ({ countryIso3 = 'USA', cartItemsOve
       console.error('[OrderSummary] Failed to fetch shipping estimates:', error);
       return null;
     }
-  }, [cartItems, country, countryIso3, shippingState]);
+  }, [cartItems, checkoutBlocked, country, countryIso3, shippingState]);
 
   //   UseEffects
   useEffect(() => {
@@ -148,14 +154,29 @@ const OrderSummary: FC<OrderSummaryProps> = ({ countryIso3 = 'USA', cartItemsOve
         <GlobalProductPrice className='flex-1 min-w-[35%] text-right' usdAmount={estimatedTotal} />
       </div>
 
-      <CustomShopLink
-        href='/shop/checkout'
-        className={`w-[95%] text-center !mx-auto py-4 px-4 text-xl mt-10 rounded-3xl 
-            bg-white text-black hover:bg-gray-200  gap-2 !flex justify-center items-center`}
-        // name='Checkout Button'
-      >
-        <h4>Proceed to Checkout</h4> <FaAngleRight size={22.5} />
-      </CustomShopLink>
+      {checkoutBlocked ? (
+        <>
+          <p role='alert' className='pt-6 text-sm font-semibold text-amber-200'>
+            Remove unavailable items or choose another available option before checkout.
+          </p>
+          <Button
+            name='Proceed to Checkout'
+            type='button'
+            disabled
+            aria-disabled='true'
+            className='w-[95%] text-center !mx-auto py-4 px-4 text-xl mt-4 rounded-3xl bg-white text-black gap-2 !flex justify-center items-center'
+          >
+            <span>Proceed to Checkout</span> <FaAngleRight size={22.5} />
+          </Button>
+        </>
+      ) : (
+        <CustomShopLink
+          href='/shop/checkout'
+          className='w-[95%] text-center !mx-auto py-4 px-4 text-xl mt-10 rounded-3xl bg-white text-black hover:bg-gray-200 gap-2 !flex justify-center items-center'
+        >
+          <h4>Proceed to Checkout</h4> <FaAngleRight size={22.5} />
+        </CustomShopLink>
+      )}
     </section>
   );
 };

@@ -2,6 +2,7 @@
 import { merchizeCatalogPrisma } from '@/lib/prisma/shop/merchize/merchizeCatalogPrisma';
 // 🔧 adjust this import path if your generated client lives elsewhere
 import type { Prisma } from '../prisma/shop/merchize/generated/merchizeCatalog/client';
+import { randomUUID } from 'node:crypto';
 
 const CATALOG_URL = process.env.MERCHIZE_CATALOG_URL!;
 const API_KEY = process.env.MERCHIZE_API_KEY!;
@@ -95,6 +96,140 @@ export interface MerchizeCatalogPage {
 
 const SAFETY_MAX_PAGES = 10_000; // absolute hard stop
 const SAFETY_MAX_VARIANTS = 100_000; // hard cap for variants ingested per run
+const CATALOG_SYNC_STATE_ID = 'merchize_catalog';
+const DEFAULT_CATALOG_SYNC_LEASE_MINUTES = 30;
+export const CATALOG_SYNC_VARIANT_WRITE_BATCH_SIZE = 25;
+
+export class MerchizeCatalogRefreshInProgressError extends Error {
+  readonly code = 'MERCHIZE_CATALOG_REFRESH_IN_PROGRESS' as const;
+
+  constructor() {
+    super('A Merchize catalog refresh is already in progress.');
+    this.name = 'MerchizeCatalogRefreshInProgressError';
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export class MerchizeCatalogRefreshLeaseLostError extends Error {
+  readonly code = 'MERCHIZE_CATALOG_REFRESH_LEASE_LOST' as const;
+
+  constructor() {
+    super('The Merchize catalog refresh no longer owns its database lease.');
+    this.name = 'MerchizeCatalogRefreshLeaseLostError';
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function createCatalogRefreshSingleFlight<T>(run: () => Promise<T>) {
+  let active = false;
+  return async () => {
+    if (active) throw new MerchizeCatalogRefreshInProgressError();
+    active = true;
+    try {
+      return await run();
+    } finally {
+      active = false;
+    }
+  };
+}
+
+export async function runCatalogLeaseFencedOperation<T>({
+  renewLease,
+  write,
+}: {
+  renewLease: () => Promise<boolean>;
+  write: () => Promise<T>;
+}) {
+  if (!(await renewLease())) throw new MerchizeCatalogRefreshLeaseLostError();
+  return write();
+}
+
+export function getCatalogGenerationCommitPolicy(completedFullTraversal: boolean) {
+  return {
+    markSeenRowsCurrent: completedFullTraversal,
+    retireUnseenRows: completedFullTraversal,
+    replaceCompletedGeneration: completedFullTraversal,
+    invalidateCompletedGeneration: !completedFullTraversal,
+  } as const;
+}
+
+export function buildShippingBandPruneWhere(variantId: string, currentZones: string[]) {
+  return {
+    variantId,
+    ...(currentZones.length ? { toZone: { notIn: currentZones } } : {}),
+  };
+}
+
+function catalogSyncLeaseMs() {
+  const raw = process.env.MERCHIZE_CATALOG_SYNC_LEASE_MINUTES?.trim();
+  const configured = raw ? Number(raw) : Number.NaN;
+  const minutes = Number.isFinite(configured)
+    ? Math.min(Math.max(configured, 5), 180)
+    : DEFAULT_CATALOG_SYNC_LEASE_MINUTES;
+  return minutes * 60 * 1_000;
+}
+
+async function acquireCatalogSyncLease(runId: string, startedAt: Date) {
+  // Ensure the singleton row exists. The update branch is a deliberate no-op so the following
+  // conditional update remains the atomic lease claim.
+  await merchizeCatalogPrisma.syncState.upsert({
+    where: { id: CATALOG_SYNC_STATE_ID },
+    create: {
+      id: CATALOG_SYNC_STATE_ID,
+      lastRunAt: startedAt,
+      activeRunId: runId,
+      activeRunHeartbeatAt: startedAt,
+    },
+    update: { lastPage: { increment: 0 } },
+  });
+
+  const staleBefore = new Date(startedAt.getTime() - catalogSyncLeaseMs());
+  const claim = await merchizeCatalogPrisma.syncState.updateMany({
+    where: {
+      id: CATALOG_SYNC_STATE_ID,
+      OR: [
+        { activeRunId: null },
+        { activeRunId: runId },
+        { activeRunHeartbeatAt: null },
+        { activeRunHeartbeatAt: { lt: staleBefore } },
+      ],
+    },
+    data: {
+      activeRunId: runId,
+      activeRunHeartbeatAt: startedAt,
+      lastRunAt: startedAt,
+    },
+  });
+  if (claim.count !== 1) throw new MerchizeCatalogRefreshInProgressError();
+}
+
+async function heartbeatCatalogSyncLease(runId: string) {
+  const heartbeat = await merchizeCatalogPrisma.syncState.updateMany({
+    where: { id: CATALOG_SYNC_STATE_ID, activeRunId: runId },
+    data: { activeRunHeartbeatAt: new Date() },
+  });
+  if (heartbeat.count !== 1) throw new MerchizeCatalogRefreshLeaseLostError();
+}
+
+async function withCatalogSyncLeaseTransaction<T>(
+  runId: string,
+  write: (tx: Prisma.TransactionClient) => Promise<T>,
+) {
+  // The conditional lease renewal is the first write in the same SQLite transaction as the
+  // bounded catalog mutation. A successor cannot take over between the fence and these writes.
+  return merchizeCatalogPrisma.$transaction((tx) =>
+    runCatalogLeaseFencedOperation({
+      renewLease: async () => {
+        const ownership = await tx.syncState.updateMany({
+          where: { id: CATALOG_SYNC_STATE_ID, activeRunId: runId },
+          data: { activeRunHeartbeatAt: new Date() },
+        });
+        return ownership.count === 1;
+      },
+      write: () => write(tx),
+    }),
+  );
+}
 
 function toJsonValue(value: unknown): Prisma.InputJsonValue | undefined {
   // Prisma JSON inputs for optional fields should be either a valid JSON value or undefined.
@@ -159,7 +294,12 @@ async function fetchCatalogPage(
 
 // --- Per-product + per-variant upsert helpers --------------------------
 
-async function upsertProduct(product: MerchizeProduct) {
+async function upsertProduct(
+  tx: Prisma.TransactionClient,
+  product: MerchizeProduct,
+  runId: string,
+  observedAt: Date,
+) {
   const merchizeProductId = String(product._id);
 
   const dataBase = {
@@ -175,16 +315,24 @@ async function upsertProduct(product: MerchizeProduct) {
     printingJson: toJsonValue(product.printing_methods ?? null),
     attributesJson: toJsonValue(product.attributes ?? null),
     mockupUrl: product.mockup_and_templates_link ?? null,
+    catalogLastSeenRunId: runId,
+    catalogLastSeenAt: observedAt,
   };
 
-  return merchizeCatalogPrisma.product.upsert({
+  return tx.product.upsert({
     where: { merchizeId: merchizeProductId },
-    create: dataBase,
+    create: { ...dataBase, catalogCurrent: false },
     update: dataBase,
   });
 }
 
-async function upsertVariantAndBands(productRecordId: string, variant: MerchizeVariant) {
+async function upsertVariantAndBands(
+  tx: Prisma.TransactionClient,
+  productRecordId: string,
+  variant: MerchizeVariant,
+  runId: string,
+  observedAt: Date,
+) {
   const merchizeVariantId = String(variant._id);
   const { tier1, tier2, tier3 } = extractTierPrices(variant.tiers);
 
@@ -197,22 +345,25 @@ async function upsertVariantAndBands(productRecordId: string, variant: MerchizeV
     tier1Price: tier1,
     tier2Price: tier2,
     tier3Price: tier3,
+    catalogLastSeenRunId: runId,
+    catalogLastSeenAt: observedAt,
   };
 
-  const variantRecord = await merchizeCatalogPrisma.variant.upsert({
+  const variantRecord = await tx.variant.upsert({
     where: { merchizeId: merchizeVariantId },
-    create: variantDataBase,
+    create: { ...variantDataBase, catalogCurrent: false },
     update: variantDataBase,
   });
 
   const bands: MerchizeShippingPrice[] = variant.shipping_prices ?? [];
+  const currentZones = [...new Set(bands.map((band) => band.to_zone).filter(Boolean))];
   for (const s of bands) {
     // Support both old (first_item/additional_item) and new (first_item_price/additional_item_price) field names.
     // Use null only when all candidates are undefined; keep 0 as a valid "free shipping" value.
     const first = s.first_item ?? s.first_item_price ?? null;
     const addl = s.additional_item ?? s.additional_item_price ?? null;
 
-    await merchizeCatalogPrisma.shippingBand.upsert({
+    await tx.shippingBand.upsert({
       where: {
         variantId_toZone: {
           variantId: variantRecord.id,
@@ -232,16 +383,55 @@ async function upsertVariantAndBands(productRecordId: string, variant: MerchizeV
     });
   }
 
+  // The variant payload is complete for its shipping zones. Remove zones no longer returned so a
+  // historical band cannot remain positive P0.2 shipping evidence after a successful row refresh.
+  await tx.shippingBand.deleteMany({
+    where: buildShippingBandPruneWhere(variantRecord.id, currentZones),
+  });
+
   return 1; // number of variants ingested
+}
+
+async function upsertProductWithLease(product: MerchizeProduct, runId: string, observedAt: Date) {
+  return withCatalogSyncLeaseTransaction(runId, (tx) =>
+    upsertProduct(tx, product, runId, observedAt),
+  );
+}
+
+async function upsertVariantBatchWithLease({
+  productRecordId,
+  variants,
+  runId,
+  observedAt,
+}: {
+  productRecordId: string;
+  variants: MerchizeVariant[];
+  runId: string;
+  observedAt: Date;
+}) {
+  // Keep the transaction bounded: it includes at most CATALOG_SYNC_VARIANT_WRITE_BATCH_SIZE
+  // variants and their shipping bands, with a lease fence as its first statement.
+  return withCatalogSyncLeaseTransaction(runId, async (tx) => {
+    let ingested = 0;
+    for (const variant of variants) {
+      ingested += await upsertVariantAndBands(tx, productRecordId, variant, runId, observedAt);
+    }
+    return ingested;
+  });
 }
 
 // --- Main sync ---------------------------------------------------------
 
-export async function refreshMerchizeCatalog() {
+async function runMerchizeCatalogRefresh() {
   const startedAt = new Date();
+  const runId = randomUUID();
   let page = 1;
   let ingestedVariants = 0;
   let totalProducts = 0;
+  let completedFullTraversal = false;
+  let hitSafetyCap = false;
+
+  await acquireCatalogSyncLease(runId, startedAt);
 
   // Simple log so you can see when a run starts in the server logs
   console.log('[MerchizeCatalog] Refresh started at', startedAt.toISOString());
@@ -255,6 +445,7 @@ export async function refreshMerchizeCatalog() {
       totalProducts = total;
       if (!products || products.length === 0) {
         console.log(`[MerchizeCatalog] No products found on page ${currentPage}, stopping sync.`);
+        completedFullTraversal = total === 0 && currentPage === 1;
         break;
       }
 
@@ -266,27 +457,44 @@ export async function refreshMerchizeCatalog() {
 
       // Process this page's products sequentially to keep memory lower
       for (const product of products) {
-        const productRecord = await upsertProduct(product);
+        const observedAt = new Date();
+        const productRecord = await upsertProductWithLease(product, runId, observedAt);
         const variants: MerchizeVariant[] = product.variants ?? [];
 
-        for (const v of variants) {
-          ingestedVariants += await upsertVariantAndBands(productRecord.id, v);
-
-          // Safety cap – bail out if we somehow hit a huge catalog
-          if (ingestedVariants >= SAFETY_MAX_VARIANTS) {
-            console.warn(
-              `[MerchizeCatalog] Reached SAFETY_MAX_VARIANTS (${SAFETY_MAX_VARIANTS}), aborting further ingestion.`,
-            );
-            break;
-          }
+        for (
+          let offset = 0;
+          offset < variants.length && ingestedVariants < SAFETY_MAX_VARIANTS;
+          offset += CATALOG_SYNC_VARIANT_WRITE_BATCH_SIZE
+        ) {
+          const remainingCapacity = SAFETY_MAX_VARIANTS - ingestedVariants;
+          const batch = variants.slice(
+            offset,
+            offset + Math.min(CATALOG_SYNC_VARIANT_WRITE_BATCH_SIZE, remainingCapacity),
+          );
+          ingestedVariants += await upsertVariantBatchWithLease({
+            productRecordId: productRecord.id,
+            variants: batch,
+            runId,
+            observedAt,
+          });
         }
 
-        if (ingestedVariants >= SAFETY_MAX_VARIANTS) break;
+        // Safety cap – bail out if we somehow hit a huge catalog
+        if (ingestedVariants >= SAFETY_MAX_VARIANTS) {
+          hitSafetyCap = true;
+          console.warn(
+            `[MerchizeCatalog] Reached SAFETY_MAX_VARIANTS (${SAFETY_MAX_VARIANTS}), aborting further ingestion.`,
+          );
+          break;
+        }
       }
+
+      await heartbeatCatalogSyncLease(runId);
 
       // compute if we have reached the last page
       const lastPage = Math.ceil(total / pageLimit);
-      if (currentPage >= lastPage) {
+      if (currentPage >= lastPage && !hitSafetyCap) {
+        completedFullTraversal = true;
         console.log(`[MerchizeCatalog] Reached last page (${currentPage}/${lastPage}), stopping.`);
         break;
       }
@@ -295,50 +503,95 @@ export async function refreshMerchizeCatalog() {
     }
 
     const now = new Date();
-    await merchizeCatalogPrisma.syncState.upsert({
-      where: { id: 'merchize_catalog' },
-      create: {
-        id: 'merchize_catalog',
-        lastPage: page,
-        lastTotal: totalProducts,
-        lastRunAt: now,
-        lastSuccessAt: now,
-      },
-      update: {
-        lastPage: page,
-        lastTotal: totalProducts,
-        lastRunAt: now,
-        lastSuccessAt: now,
-      },
-    });
+    const commitPolicy = getCatalogGenerationCommitPolicy(completedFullTraversal);
+    if (commitPolicy.replaceCompletedGeneration) {
+      await withCatalogSyncLeaseTransaction(runId, async (tx) => {
+        await tx.variant.updateMany({
+          where: { catalogLastSeenRunId: runId },
+          data: { catalogCurrent: true, catalogRetiredAt: null },
+        });
+        await tx.product.updateMany({
+          where: { catalogLastSeenRunId: runId },
+          data: { catalogCurrent: true, catalogRetiredAt: null },
+        });
+        await tx.variant.updateMany({
+          where: {
+            catalogCurrent: true,
+            OR: [{ catalogLastSeenRunId: null }, { catalogLastSeenRunId: { not: runId } }],
+          },
+          data: { catalogCurrent: false, catalogRetiredAt: now },
+        });
+        await tx.product.updateMany({
+          where: {
+            catalogCurrent: true,
+            OR: [{ catalogLastSeenRunId: null }, { catalogLastSeenRunId: { not: runId } }],
+          },
+          data: { catalogCurrent: false, catalogRetiredAt: now },
+        });
+        await tx.syncState.update({
+          where: { id: CATALOG_SYNC_STATE_ID },
+          data: {
+            lastPage: page,
+            lastTotal: totalProducts,
+            lastRunAt: now,
+            lastSuccessAt: now,
+            lastCompletedRunId: runId,
+            lastCompletedAt: now,
+            activeRunId: null,
+            activeRunHeartbeatAt: null,
+          },
+        });
+      });
+    } else {
+      // A partial/capped traversal never retires unseen rows. Because observed rows and shipping
+      // bands were updated in place, however, the prior generation can no longer be positive
+      // availability proof; invalidate it until a later full traversal succeeds.
+      await withCatalogSyncLeaseTransaction(runId, async (tx) => {
+        await tx.syncState.update({
+          where: { id: CATALOG_SYNC_STATE_ID },
+          data: {
+            lastPage: page,
+            lastTotal: totalProducts,
+            lastRunAt: now,
+            lastSuccessAt: now,
+            lastCompletedRunId: null,
+            lastCompletedAt: null,
+            activeRunId: null,
+            activeRunHeartbeatAt: null,
+          },
+        });
+      });
+    }
 
     console.log(
-      `[MerchizeCatalog] Refresh completed: pagesProcessed=${page}, variants=${ingestedVariants}, totalProducts=${totalProducts}`,
+      `[MerchizeCatalog] Refresh completed: pagesProcessed=${page}, variants=${ingestedVariants}, totalProducts=${totalProducts}, complete=${completedFullTraversal}`,
     );
 
-    return { ingestedVariants, totalProducts };
+    return { ingestedVariants, totalProducts, completedFullTraversal, runId };
   } catch (err) {
     const now = new Date();
     console.error('[MerchizeCatalog] Refresh failed:', err);
 
     // still record that a run was attempted
-    await merchizeCatalogPrisma.syncState.upsert({
-      where: { id: 'merchize_catalog' },
-      create: {
-        id: 'merchize_catalog',
+    await merchizeCatalogPrisma.syncState.updateMany({
+      where: { id: CATALOG_SYNC_STATE_ID, activeRunId: runId },
+      data: {
         lastPage: page,
         lastTotal: totalProducts,
         lastRunAt: now,
-        lastSuccessAt: null,
-      },
-      update: {
-        lastPage: page,
-        lastTotal: totalProducts,
-        lastRunAt: now,
-        // keep lastSuccessAt as-is on failure
+        lastCompletedRunId: null,
+        lastCompletedAt: null,
+        activeRunId: null,
+        activeRunHeartbeatAt: null,
       },
     });
 
     throw err;
   }
+}
+
+const runCatalogRefreshSingleFlight = createCatalogRefreshSingleFlight(runMerchizeCatalogRefresh);
+
+export function refreshMerchizeCatalog() {
+  return runCatalogRefreshSingleFlight();
 }

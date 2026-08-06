@@ -1,5 +1,5 @@
 // app/api/shop/products/[id]/variants/route.ts
-import { fetchProductVariants } from '@/app/shop/product/[id]/productDetailsSSR';
+import { fetchCurrentProductVariantCompatibility } from '@/app/shop/product/[id]/productDetailsSSR';
 import { merchizeErrorStatus } from '@/lib/merchizeStorefront/providerErrors';
 import { NextResponse } from 'next/server';
 
@@ -10,12 +10,29 @@ export async function GET(req: Request, ctx: { params: Params }) {
   void req;
 
   try {
-    const variants = await fetchProductVariants(id);
+    const compatibility = await fetchCurrentProductVariantCompatibility(id);
+    const verificationIncomplete = compatibility.results.some(
+      (result) => result.status === 'unverified',
+    );
+
+    if (verificationIncomplete && compatibility.sellableVariants.length === 0) {
+      return NextResponse.json(
+        { error: 'Product availability could not be verified. Please try again.' },
+        {
+          status: 503,
+          headers: { 'Cache-Control': 'private, no-store' },
+        },
+      );
+    }
+
     return NextResponse.json(
-      { data: variants },
+      {
+        data: compatibility.sellableVariants,
+        verificationIncomplete,
+      },
       {
         headers: {
-          'Cache-Control': 'public, s-maxage=3600, stale-while-revalidate=86400',
+          'Cache-Control': 'private, no-store',
         },
       },
     );

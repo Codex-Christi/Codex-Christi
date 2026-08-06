@@ -103,6 +103,10 @@ const ProductTitleAndSizesEtc = () => {
           <p className='rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-white/80'>
             Product options could not load. Refresh the page and try again.
           </p>
+        ) : productDetailsContext.productVariants.length === 0 ? (
+          <p className='rounded-lg border border-amber-300/30 bg-amber-950/20 p-3 text-sm text-amber-100'>
+            This item has no production-ready options right now.
+          </p>
         ) : (
           <>
             {sizeAttrList.length > 0 && (

@@ -11,9 +11,12 @@ Shop Ops runtime-target and scoped recovery hardening checkpoint: 2026-07-24
 
 Release sequencing checkpoint: 2026-07-27
 
-P0.2 canonical-order checkpoint: 2026-08-06. Implementation and local repository verification pass.
-No configured database was mutated. Migration deployment and deployed sandbox/E2E verification are
-pending, so the release gate remains open.
+P0.2 canonical-order checkpoint: 2026-08-06. The snapshot/payment foundation and local
+current-sellability correction are complete. Storefront `all-variants` rows are identity only;
+availability now requires exact current Product-line/options proof or completed-current-catalog SKU
+proof, with storefront and supplier SKU namespaces separate. The additive local SQLite update and
+local verification passed. PayPal ledger migration deployment and deployed sandbox/E2E verification
+remain pending.
 
 `SHOP_ALPHA_ORDER_FLOW_RELEASE_GUIDE.md` is canonical for public-alpha priority, cross-domain release
 gates, secure confirmation access, customer milestones, and E2E testing. This guide remains
@@ -37,15 +40,44 @@ ledger or creating a standalone order database:
   Trusted server/provider data owns product relationships, SKUs, current price/currency, and
   reproducible shipping;
 - explicit inactive/deleted/private/taken-down/unapproved product evidence or explicit
-  inactive/deleted/hidden/draft/retired variant evidence blocks intent creation without introducing
-  an arbitrary product/SKU allowlist;
+  inactive/deleted/hidden/draft/retired variant evidence remains an immediate block, but storefront
+  `all-variants` membership is identity input only and does not positively prove sellability;
+- current sellability must be proved independently: a variant with a `Product` option requires one
+  exact current product-line name plus complete normalized option-map match and uses that result's
+  supplier IDs/SKU; a variant without `Product` requires exact current SKU membership from a
+  completed supplier-catalog generation. Missing, ambiguous, partial, stale, or unverified evidence
+  fails closed;
+- storefront and supplier IDs/SKUs remain separate namespaces. They may differ and must not be
+  equated, substituted, or copied over one another;
+- base-product, `all-variants`, and current-price trust reads are strict `no-store` calls with the
+  bounded deadline; storefront snapshots are display-only fallback. An exact product-line/options
+  match remains provisional until its supplier product ID, variant ID, and SKU all equal the latest
+  completed catalog row, before public selection, cart admission, or snapshot creation;
+- strict catalog proof requires both the variant and parent product generation IDs to equal
+  `SyncState.lastCompletedRunId`. Bounded row writes and generation finalization are fenced inside
+  the active database-lease transaction so a stale writer cannot overwrite checkout proof;
 - selector input is bounded before provider work to 25 rows, 128 characters per identifier, 25
   units per merged line, and 100 units total. Duplicate selectors are merged and rechecked; each
   unique product resolves once with at most four concurrent workers, then catalog SKUs resolve in
   one strict batch;
-- PayPal creation uses only canonical lines, subtotal, shipping, currency, and total. Missing or
-  unproven SKU data, catalog mismatch, an unsafe shipping fallback, or an invalid quote stops intent
-  creation;
+- admin/scheduled published-variant audit sets above 100 products are globally trimmed, deduped, and
+  sorted, then scanned in sequential chunks of at most 100. Per-scan four-worker concurrency remains
+  bounded, and counts, results, and product errors are aggregated across every chunk;
+- compatibility reads time out after 15 seconds. PayPal creation uses only canonical lines,
+  subtotal, shipping, currency, and total. Missing or unproven current supplier mapping/SKU data,
+  catalog mismatch, an unsafe shipping fallback, an invalid quote, a provider timeout/outage, or
+  incomplete evidence fails closed. The same verdict is enforced at public variant display,
+  add-to-cart, cart hydration/revalidation, quantity increase, checkout entry, direct checkout, and
+  intent creation. A stale cart row remains visible/removable but cannot be increased or purchased;
+- only drift or unavailability confirmed by complete current evidence creates or updates a
+  per-variant catalog-data-health incident. Provider timeouts/outages and incomplete or otherwise
+  unverified evidence stay aggregate and do not fan out into per-variant incidents. Confirmed
+  incidents accumulate in the Storefront Data Health admin queue; P0.2 does not couple them to the
+  PayPal notification outbox or send catalog email;
+- the main Storefront Data Health page shows compact counts only; the detailed responsive repair
+  queue is `/admin/shop/storefront-data-health/variant-publication-issues`, with each issue collapsed
+  until an admin requests its IDs, provider evidence, and manual repair action. Server-side
+  pagination keeps every open issue reachable, and a storage failure never renders as a zero count;
 - authorization persists its provider evidence, but keeps `status = authorized` only after exact
   total/currency reconciliation. Invalid canonical metadata or mismatch records `status = error` with
   `CANONICAL_ORDER_SNAPSHOT_INVALID` or `PAYPAL_AUTHORIZATION_AMOUNT_MISMATCH` and returns `409`;
@@ -72,15 +104,28 @@ ledger or creating a standalone order database:
   actual completed PayPal capture money, never the expected canonical total; mismatches are review
   incidents.
 
-Local verification covers the repository source test suite for this isolated P0.2 change (132
-tests), TypeScript, ESLint, a production webpack build, checked-in Prisma 7.8 generated-client
-field/type wiring, dev/prod schema
-validation, a disposable-PostgreSQL full-chain migration smoke test, and diff checks. Production has only
-`20260806000000_add_canonical_order_snapshot` pending. Development has that migration pending plus a
-pre-existing history-name divergence: remote-only
-`20260622190331_add_paypal_ledger_transaction_webhook_bindings` versus repository migration
-`20260622190000_add_paypal_ledger_transaction_webhook_bindings`. Reconcile development history
-before migration deployment.
+The current-sellability correction is locally verified. An additive local SQLite `db push` completed,
+then a complete current-catalog generation covered 905 products and 19,885 variants. The pre-final
+live baseline audit found 141 variants across 13 products: 138 available, 3 confirmed unavailable,
+and 0 unverified. The final dual-source catalog gate has six focused regressions, and the full local
+suite passed 195/195 tests, along with TypeScript, targeted ESLint, the production webpack build, and
+diff checks. A repeat live audit under the final gate and deployed sandbox/E2E remain pending. The
+repair run sent no notification email. The apparent development
+history-name divergence was a lost legitimate migration file. Development records both
+`20260622190000_add_paypal_ledger_transaction_webhook_bindings` and the later
+`20260622190331_add_paypal_ledger_transaction_webhook_bindings` recorded successfully. The latter
+renames PostgreSQL's truncated `...paypalPaymentMode_isActiv` index to Prisma's expected
+`...paypalPaymentMode_isA_idx`; its exact SQL has been restored with SHA-256
+`2356add3eeef5a0e2c45d179244f99c262c4658590beb55116243f0c7787df3e`.
+
+Do not edit either applied migration, alter `_prisma_migrations`, reset a configured ledger, or use
+`migrate resolve`. The restored 13-migration chain passes on disposable PostgreSQL. Read-only status
+confirms only `20260806000000_add_canonical_order_snapshot` pending in development and the restored
+rename as production's first pending migration. The next move is explicitly approved `prisma migrate
+deploy` on development; it should skip the already-recorded rename and apply only the canonical
+migration. Run deployed PayPal sandbox/E2E verification next. Production's later reviewed rollout
+must deploy and verify the rename, recheck status, then deploy the canonical migration. P0.3 follows
+as a read-only destination-behavior trace.
 
 The snapshot intentionally contains merchandise plus shipping only. The current PayPal account
 cannot charge tax, so there is no tax amount or tax line in the canonical snapshot, PayPal purchase
@@ -596,9 +641,12 @@ prisma/shop/paypal/migrations/20260806000000_add_canonical_order_snapshot/migrat
 It adds the three nullable fields and the
 `PaypalIntent_canonicalOrderSnapshot_complete` check constraint. Existing rows are not backfilled:
 the all-null triple is the only supported legacy envelope. The SQL and both target-selected schemas
-have passed local validation without mutating a configured database. Production has this migration
-pending. Development has it pending but also has the pre-existing webhook-binding migration-name
-divergence documented in the P0.2 checkpoint above; reconcile that history before deploy.
+have passed local validation without mutating a configured database. The lost
+`20260622190331_add_paypal_ledger_transaction_webhook_bindings` index-rename migration has now been
+restored exactly as documented in the P0.2 checkpoint above. The complete 13-migration history
+passes on disposable PostgreSQL. Read-only status confirms that development already records the
+rename and should apply only the canonical-snapshot migration; production stops first at the rename
+and must apply and verify it before the canonical-snapshot migration in its later reviewed rollout.
 
 ## Deploy migrations (production)
 
@@ -765,10 +813,17 @@ prices, SKUs, shipping totals, country codes, or currency as authoritative order
 `selections` containing only product ID, variant ID, and quantity, resolves and seals the canonical
 snapshot server-side, persists all three canonical ledger fields, and passes that verified snapshot
 to `createPayPalOrder`. Selection/identifier/quantity budgets and max-four unique-product
-concurrency prevent a public request from amplifying into unbounded provider work. Trusted
-publication state rejects unavailable products/variants without creating a separate allowlist. The
-older code templates in 13a/13b are retained as historical structure only and must not be copied
-over the current implementation.
+concurrency prevent a public request from amplifying into unbounded provider work. `all-variants`
+proves storefront identity only. The implemented correction requires exact current Product-line/
+options evidence plus an exact supplier product ID, variant ID, and SKU match in the latest completed
+catalog generation; the no-Product path requires exact current-catalog SKU evidence. It keeps
+storefront/supplier namespaces separate and applies a 15-second compatibility-read timeout. Public
+display, add-to-cart, stale-cart hydration/revalidation, quantity increase, checkout, direct checkout,
+and intent creation fail closed; stale rows stay visible/removable. Only confirmed drift creates a
+per-variant incident,
+while transient/incomplete/unverified provider evidence remains aggregate and does not create an
+alert flood. The older code templates in 13a/13b are retained as historical structure only and must
+not be copied over the current implementation.
 
 ## 13a) Extract create-order logic into a shared function
 
@@ -3222,6 +3277,20 @@ Why this is safe:
 - Create intent from checkout.
 - Verify product/variant/quantity are selectors only and that browser title, SKU, price, currency,
   and shipping values cannot alter the sealed snapshot or PayPal payload.
+- Verify a stale storefront `all-variants` row absent from the current product line cannot be added
+  to cart, remains visible/removable when already in the cart but cannot be increased or checked out,
+  and cannot create a PayPal intent.
+- Verify exact and unambiguous Product-line/full-option matching followed by exact supplier product
+  ID, variant ID, and SKU agreement with the completed catalog; verify missing/mismatched catalog
+  identity blocks cart admission. Also verify the no-Product completed-catalog exact-SKU path,
+  incomplete catalog/provider fail-closed behavior, and that storefront/supplier IDs and SKUs stay
+  distinct through snapshot and fulfillment consumers.
+- Verify confirmed mapping drift creates one per-variant actionable catalog-health incident whose
+  occurrence evidence updates on repeats without creating a payment ledger row.
+- Verify the 15-second compatibility-read timeout and transient/incomplete provider evidence fail
+  closed as `unverified` at every entry point, remain aggregate, and do not create per-variant
+  incidents. Verify confirmed incidents accumulate only in the detailed Storefront Data Health
+  queue and do not create PayPal outbox rows or catalog email.
 - Verify missing/unproven SKU, catalog mismatch, unsafe shipping fallback, and invalid shipping
   quote stop intent creation.
 - Verify explicit inactive/deleted/private/taken-down/unapproved product evidence and explicit
@@ -3229,6 +3298,9 @@ Why this is safe:
 - Verify the 25-selector, 128-character-ID, 25-units-per-merged-line, and 100-total-unit limits are
   enforced before provider work; duplicates resolve once, unique-product lookups never exceed four
   concurrent workers, and catalog SKU proof is fetched in one strict batch.
+- Verify a published audit with more than 100 discovered products uses deterministic sequential
+  chunks of at most 100, preserves the four-worker per-scan limit, and aggregates every chunk's
+  counts, results, and product errors.
 - Authorize/capture routes write ledger payloads.
 - Verify exact authorization and capture total/currency match succeeds; amount mismatch, currency
   mismatch, missing provider money, partial canonical metadata, invalid hash, and external

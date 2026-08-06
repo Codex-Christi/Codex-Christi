@@ -11,8 +11,8 @@ generator merchizeCatalogClient {
 }
 
 model Product {
-  id             String    @id @default(cuid())
-  merchizeId     String    @unique
+  id             String  @id @default(cuid())
+  merchizeId     String  @unique
   skuPrefix      String?
   title          String?
   slug           String?
@@ -25,75 +25,127 @@ model Product {
   attributesJson Json?
   mockupUrl      String?
 
-  variants       Variant[]
+  // A row is current only after it was observed in the latest complete catalog generation.
+  catalogCurrent       Boolean   @default(true)
+  catalogLastSeenRunId String?
+  catalogLastSeenAt    DateTime?
+  catalogRetiredAt     DateTime?
 
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  variants Variant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([skuPrefix])
   @@index([fulfillCode])
+  @@index([catalogCurrent])
+  @@index([catalogLastSeenRunId])
 }
 
 model Variant {
-  id         String   @id @default(cuid())
-  merchizeId String   @unique
-  sku        String   @unique
+  id         String  @id @default(cuid())
+  merchizeId String  @unique
+  sku        String  @unique
   productId  String
-  product    Product  @relation(fields: [productId], references: [id])
+  product    Product @relation(fields: [productId], references: [id])
 
   attributesJson Json?
   tiersJson      Json?
 
-  tier1Price     Float?
-  tier2Price     Float?
-  tier3Price     Float?
+  tier1Price Float?
+  tier2Price Float?
+  tier3Price Float?
 
-  shippingBands  ShippingBand[]
+  // Historical rows remain available for diagnostics but are never positive checkout proof.
+  catalogCurrent       Boolean   @default(true)
+  catalogLastSeenRunId String?
+  catalogLastSeenAt    DateTime?
+  catalogRetiredAt     DateTime?
 
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  shippingBands ShippingBand[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([sku])
+  @@index([catalogCurrent])
+  @@index([catalogLastSeenRunId])
 }
 
 model ShippingBand {
-  id         String  @id @default(cuid())
-  variantId  String
-  variant    Variant @relation(fields: [variantId], references: [id])
+  id        String  @id @default(cuid())
+  variantId String
+  variant   Variant @relation(fields: [variantId], references: [id])
 
-  toZone     String
-  firstItem  Float?
-  addlItem   Float?
+  toZone    String
+  firstItem Float?
+  addlItem  Float?
 
   @@unique([variantId, toZone])
   @@index([toZone])
 }
 
 model SyncState {
-  id            String   @id @default("merchize_catalog")
-  lastPage      Int      @default(0)
-  lastTotal     Int      @default(0)
-  lastRunAt     DateTime @default(now())
-  lastSuccessAt DateTime?
+  id                   String    @id @default("merchize_catalog")
+  lastPage             Int       @default(0)
+  lastTotal            Int       @default(0)
+  lastRunAt            DateTime  @default(now())
+  lastSuccessAt        DateTime?
+  lastCompletedRunId   String?
+  lastCompletedAt      DateTime?
+  activeRunId          String?
+  activeRunHeartbeatAt DateTime?
+}
+
+model StorefrontVariantCompatibility {
+  id                     String    @id @default(cuid())
+  storefrontProductId    String
+  storefrontVariantId    String
+  storefrontProductSlug  String?
+  storefrontProductTitle String?
+  storefrontSku          String?
+  supplierProductId      String?
+  supplierVariantId      String?
+  supplierSku            String?
+  productLineName        String?
+  selectedOptionsJson    Json?
+  providerEvidenceJson   Json?
+  evidenceHash           String?
+  status                 String    @default("unverified")
+  reasonCode             String
+  occurrenceCount        Int       @default(1)
+  incidentEpisode        Int       @default(1)
+  firstObservedAt        DateTime  @default(now())
+  lastObservedAt         DateTime  @default(now())
+  lastVerifiedAt         DateTime?
+  resolvedAt             DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  @@unique([storefrontProductId, storefrontVariantId])
+  @@index([status, lastObservedAt])
+  @@index([reasonCode, status])
+  @@index([supplierSku])
+  @@index([storefrontProductId, status])
 }
 
 model StorefrontProductSnapshot {
-  id                    String   @id @default(cuid())
-  merchizeProductId     String   @unique
-  slug                  String?
-  title                 String?
-  description           String?
-  image                 String?
-  retailPrice           Float?
-  rawProductJson        Json?
-  variantsJson          Json?
-  variantCount          Int      @default(0)
-  firstSeenAt           DateTime @default(now())
-  lastSeenAt            DateTime @default(now())
-  lastProductFetchAt    DateTime?
-  lastVariantsFetchAt   DateTime?
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+  id                  String    @id @default(cuid())
+  merchizeProductId   String    @unique
+  slug                String?
+  title               String?
+  description         String?
+  image               String?
+  retailPrice         Float?
+  rawProductJson      Json?
+  variantsJson        Json?
+  variantCount        Int       @default(0)
+  firstSeenAt         DateTime  @default(now())
+  lastSeenAt          DateTime  @default(now())
+  lastProductFetchAt  DateTime?
+  lastVariantsFetchAt DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
 
   categories StorefrontCategoryProduct[]
 
@@ -102,21 +154,21 @@ model StorefrontProductSnapshot {
 }
 
 model StorefrontCategorySnapshot {
-  id                 String   @id @default(cuid())
-  categorySlug       String   @unique
-  merchizeCategoryId String?
-  name               String?
-  description        String?
-  coverUrl           String?
-  rawCategoryJson    Json?
-  totalProducts      Int?
-  totalPages         Int?
-  lastSyncedPage     Int?
+  id                    String    @id @default(cuid())
+  categorySlug          String    @unique
+  merchizeCategoryId    String?
+  name                  String?
+  description           String?
+  coverUrl              String?
+  rawCategoryJson       Json?
+  totalProducts         Int?
+  totalPages            Int?
+  lastSyncedPage        Int?
   lastSuccessfulFetchAt DateTime?
-  lastMetadataFetchAt DateTime?
-  lastProductsFetchAt DateTime?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  lastMetadataFetchAt   DateTime?
+  lastProductsFetchAt   DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
 
   products StorefrontCategoryProduct[]
 

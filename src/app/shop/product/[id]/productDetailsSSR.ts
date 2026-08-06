@@ -18,6 +18,7 @@ import type {
   ProductResult,
   ProductVariantsInterface,
 } from '@/lib/merchizeStorefront/productTypes';
+import { resolveProviderStorefrontProductCompatibility } from '@/lib/merchizeStorefront/currentProductLineCompatibility';
 
 // --- Env Config ---
 // const merchizeToken = process.env.MERCHIZE_TOKEN!;
@@ -146,22 +147,42 @@ export const fetchProductVariants = cache((productIDorSlug: string) => {
   })();
 });
 
+const fetchLiveProductVariantCompatibility = cache((productIDorSlug: string) =>
+  resolveProviderStorefrontProductCompatibility(productIDorSlug, { persist: true }),
+);
+
+export const fetchCurrentProductVariantCompatibility = cache(async (productIDorSlug: string) => {
+  const providerProduct = await fetchLiveProductVariantCompatibility(productIDorSlug);
+  return providerProduct.compatibility;
+});
+
+export const fetchSellableProductVariants = cache(async (productIDorSlug: string) => {
+  const compatibility = await fetchCurrentProductVariantCompatibility(productIDorSlug);
+  return compatibility.sellableVariants;
+});
+
 // --- Combined Full Fetch ---
 export const getProductDetailsSSR = cache(
   async (productIDorSlug: string): Promise<ProductResult> => {
     try {
-      const [productMetaData, productVariants] = await Promise.all([
-        fetchBaseProduct(productIDorSlug),
-        fetchProductVariants(productIDorSlug),
-      ]);
-
-      return { productMetaData, productVariants };
+      const providerProduct = await fetchLiveProductVariantCompatibility(productIDorSlug);
+      return {
+        productMetaData: providerProduct.productMetaData,
+        productVariants: providerProduct.compatibility.sellableVariants,
+      };
     } catch (err) {
-      if (!shouldUseStorefrontSnapshot(err)) throw err;
+      if (!shouldUseStorefrontSnapshot(err) && !isInvalidStorefrontProductPayloadError(err)) {
+        throw err;
+      }
 
       const snapshot = await getProductDetailsFromSnapshot(productIDorSlug);
       if (!snapshot) throw err;
-      return snapshot;
+      // Snapshot data may keep the page understandable during a provider outage, but it is display
+      // metadata only. It never provides positive current availability evidence.
+      return {
+        ...snapshot,
+        productVariants: [],
+      };
     }
   },
 );

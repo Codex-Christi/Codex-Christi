@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useState, useTransition, type ReactNode } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import {
   ArrowRight,
   ClipboardCheck,
@@ -51,6 +53,12 @@ type Props = {
   initialSyncState: SyncState | null;
   initialSamples: VariantWithRelations[];
   initialStorefrontSnapshotStats: StorefrontSnapshotStats;
+  initialVariantPublicationIssueSummary: {
+    openIssueCount: number;
+    unavailableIssueCount: number;
+    unverifiedIssueCount: number;
+    storageError: string | null;
+  };
 };
 
 type StorefrontSnapshotStats = {
@@ -92,7 +100,9 @@ export default function StorefrontDataHealthAdminClient({
   initialSyncState,
   initialSamples,
   initialStorefrontSnapshotStats,
+  initialVariantPublicationIssueSummary,
 }: Props) {
+  const router = useRouter();
   const [syncState, setSyncState] = useState<SyncState | null>(initialSyncState);
   const [storefrontSnapshotStats, setStorefrontSnapshotStats] = useState<StorefrontSnapshotStats>(
     initialStorefrontSnapshotStats,
@@ -134,12 +144,18 @@ export default function StorefrontDataHealthAdminClient({
         if (res.ok) {
           setSyncState(res.syncState ?? null);
           setRefreshProgress(100);
-          const msg = `Refreshed. Variants: ${res.ingestedVariants}, products: ${res.totalProducts}`;
+          const auditText = res.variantCompatibilityAudit
+            ? res.variantCompatibilityAudit.ok
+              ? ` Compatibility audit: ${res.variantCompatibilityAudit.unavailableCount} unavailable, ${res.variantCompatibilityAudit.unverifiedCount} unverified.`
+              : ` Compatibility audit failed: ${res.variantCompatibilityAudit.error}`
+            : ' Compatibility audit was deferred because the catalog traversal was incomplete.';
+          const msg = `Refreshed. Variants: ${res.ingestedVariants}, products: ${res.totalProducts}.${auditText}`;
           setStatus({
             type: 'success',
             message: msg,
           });
           showSuccessToast({ header: 'Price and shipping catalog refreshed', message: msg });
+          router.refresh();
         } else {
           setRefreshProgress(0);
           const msg = res.error ?? 'Refresh failed.';
@@ -147,9 +163,10 @@ export default function StorefrontDataHealthAdminClient({
             type: 'error',
             message: msg,
           });
-          showErrorToast?.({ header: 'Search failed', message: msg });
+          showErrorToast?.({ header: 'Refresh failed', message: msg });
         }
       } catch (e: unknown) {
+        toast.dismiss(loadID1);
         setRefreshProgress(0);
         const message = e instanceof Error ? e.message : 'Refresh failed.';
         setStatus({ type: 'error', message });
@@ -193,7 +210,10 @@ export default function StorefrontDataHealthAdminClient({
           'prunedGenerations' in res.seoManifest && res.seoManifest.prunedGenerations.length
             ? ` Pruned manifest generations: ${res.seoManifest.prunedGenerations.length}.`
             : '';
-        const msg = `Storefront snapshots refreshed. Pages: ${res.pagesFetched}, products seen: ${res.productsSeen}, published products attempted: ${res.publishedProductsAttempted}.${seoManifestText}${seoManifestPrunedText}${seoManifestWarningText}${revalidationText}${failureText}${productFailureText}`;
+        const compatibilityText = res.variantCompatibilityAudit.ok
+          ? ` Compatibility audit: ${res.variantCompatibilityAudit.unavailableCount} unavailable, ${res.variantCompatibilityAudit.unverifiedCount} unverified, ${res.variantCompatibilityAudit.scanErrors.length} provider errors.`
+          : ` Compatibility audit failed: ${res.variantCompatibilityAudit.error}`;
+        const msg = `Storefront snapshots refreshed. Pages: ${res.pagesFetched}, products seen: ${res.productsSeen}, published products attempted: ${res.publishedProductsAttempted}.${seoManifestText}${seoManifestPrunedText}${seoManifestWarningText}${revalidationText}${failureText}${productFailureText}${compatibilityText}`;
 
         setStatus({
           type: res.ok ? 'success' : 'error',
@@ -205,6 +225,7 @@ export default function StorefrontDataHealthAdminClient({
         } else {
           showErrorToast({ header: 'Storefront snapshots partially failed', message: msg });
         }
+        router.refresh();
       } catch (e: unknown) {
         toast.dismiss(loadID);
         setRefreshProgress(0);
@@ -678,6 +699,71 @@ export default function StorefrontDataHealthAdminClient({
           ) : null}
         </AdminGlassPanel>
       ) : null}
+
+      <div id='variant-compatibility-issues'>
+        <AdminGlassPanel className='p-4 sm:p-5'>
+          <div className='flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between'>
+            <div>
+              <div className='flex flex-wrap items-center gap-2'>
+                <h2 className='text-base font-semibold text-white'>Variant publication issues</h2>
+                <span
+                  className={`inline-flex rounded-md border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${
+                    initialVariantPublicationIssueSummary.storageError ||
+                    initialVariantPublicationIssueSummary.openIssueCount
+                      ? 'border-amber-300/20 bg-amber-300/10 text-amber-100'
+                      : 'border-emerald-300/20 bg-emerald-300/10 text-emerald-100'
+                  }`}
+                >
+                  {initialVariantPublicationIssueSummary.storageError
+                    ? 'Counts unavailable'
+                    : initialVariantPublicationIssueSummary.openIssueCount
+                      ? `${initialVariantPublicationIssueSummary.openIssueCount} open`
+                      : 'No open issues'}
+                </span>
+              </div>
+              <p className='mt-1 max-w-2xl text-xs leading-5 text-slate-500'>
+                Variants that cannot be matched safely to the current supplier catalog stay out of
+                selection, cart additions, and checkout until repaired.
+              </p>
+            </div>
+
+            <Link
+              href='/admin/shop/storefront-data-health/variant-publication-issues'
+              aria-label='Open detailed variant publication issue queue'
+              className='inline-flex w-fit shrink-0 items-center gap-2 rounded-lg border border-cyan-300/20 bg-cyan-300/10 px-3 py-2 text-xs font-medium text-cyan-100 transition hover:bg-cyan-300/15'
+            >
+              Review issue queue <ArrowRight size={13} aria-hidden='true' />
+            </Link>
+          </div>
+
+          {!initialVariantPublicationIssueSummary.storageError ? (
+            <dl className='mt-4 grid gap-3 text-xs sm:grid-cols-3'>
+              <MiniStatus
+                label='Open'
+                value={String(initialVariantPublicationIssueSummary.openIssueCount)}
+              />
+              <MiniStatus
+                label='Unavailable'
+                value={String(initialVariantPublicationIssueSummary.unavailableIssueCount)}
+              />
+              <MiniStatus
+                label='Unverified'
+                value={String(initialVariantPublicationIssueSummary.unverifiedIssueCount)}
+              />
+            </dl>
+          ) : null}
+
+          {initialVariantPublicationIssueSummary.storageError ? (
+            <p
+              role='alert'
+              className='mt-3 rounded-lg border border-amber-300/15 bg-amber-300/[0.06] px-3 py-2 text-xs leading-5 text-amber-100'
+            >
+              Variant compatibility storage is not ready, so issue counts are unavailable. Apply the
+              additive Merchize catalog schema update and reload this page.
+            </p>
+          ) : null}
+        </AdminGlassPanel>
+      </div>
 
       <section className='grid gap-3 sm:grid-cols-2 xl:grid-cols-3'>
         <StatTile label='Last catalog run' value={lastRun} />

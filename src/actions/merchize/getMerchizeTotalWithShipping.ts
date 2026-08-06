@@ -4,7 +4,7 @@
 import { cache } from 'react';
 import { ShippingCountryObj } from '@/lib/datasetSearchers/shippingSupportMerchize';
 import { CartVariant } from '@/stores/shop_stores/cartStore';
-import { getCatalogItems } from './getItemCatalogInfo';
+import { getStrictCatalogVariantsBySku } from '@/lib/datasetSearchers/merchize/catalog';
 import { currencyCodesWithoutDecimalPrecision } from '@/datasets/shop_general/paypal_currency_specifics';
 import { symbolFromCurrency } from '@/lib/currency/symbol';
 import { getShippingPriceMerchizecatalog, realTimePriceFromMerchize } from './priceFromMerchize';
@@ -32,8 +32,13 @@ export const getMerchizeTotalWIthShipping = cache(
     let totalUnits = 0;
 
     for (const item of cart) {
-      const sku = item.itemDetail?.sku;
-      if (!sku) continue;
+      const sku = item.itemDetail?.supplierSku;
+      if (!sku) {
+        throw new Error(`Cart variant ${item.variantId} is missing a verified supplier SKU.`);
+      }
+      if (!Number.isSafeInteger(item.quantity) || item.quantity < 1) {
+        throw new Error(`Cart variant ${item.variantId} has an invalid quantity.`);
+      }
       if (!skuCountsMap.has(sku)) {
         uniqueSkus.push(sku);
       }
@@ -55,13 +60,8 @@ export const getMerchizeTotalWIthShipping = cache(
 
     const skuCountsEntries = Array.from(skuCountsMap.entries());
 
-    let catalogRows;
-    try {
-      // ⬇️ now hits Prisma DB via getItemCatalogInfo.ts, not JSON
-      catalogRows = await getCatalogItems(uniqueSkus, country_iso3);
-    } catch (e) {
-      throw e;
-    }
+    const catalogVariants = await getStrictCatalogVariantsBySku(uniqueSkus);
+    const catalogRows = catalogVariants.map((variant) => variant.catalogRow);
 
     const variantsAndParents: VariantUnitMeta[] = cart
       .map(({ itemDetail, variantId, quantity }) => ({

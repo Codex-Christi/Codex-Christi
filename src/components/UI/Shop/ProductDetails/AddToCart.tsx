@@ -66,7 +66,7 @@ export const AddToCart: FC<OptionalProductVariantProps> = (props) => {
 
   const addToCart = useCartStore((s) => s.addToCart);
 
-  // Debounce state: blocks rapid repeat clicks for 600ms
+  // Keep only one verification/add operation in flight.
   const [isBusy, setIsBusy] = useState(false);
   const isLoadingVariants = props.isLoadingVariants ?? ctx?.variantLoadState === 'loading';
   const requiredAttributes = useMemo(
@@ -78,25 +78,33 @@ export const AddToCart: FC<OptionalProductVariantProps> = (props) => {
     requiredAttributes,
     currentVariantOptions,
   );
+  const matchingVariantIsCurrent = Boolean(
+    matchingVariant &&
+    cleanVariants.some(
+      (variant) => variant._id === matchingVariant._id && variant.sku === matchingVariant.sku,
+    ),
+  );
 
   // Use the cleaned array for messaging & indexing
   const selectOptionsMessage = useMemo(() => {
     if (isLoadingVariants) return 'Product options are still loading.';
     if (cleanVariants.length === 0) return 'This item is unavailable.';
     if (requiredAttributes.length === 0) {
-      return 'Please select product options before adding to cart.';
+      return 'This item does not have a selectable available option.';
     }
     return `Please select ${formatRequiredAttributes(requiredAttributes)} before adding to cart.`;
   }, [cleanVariants.length, isLoadingVariants, requiredAttributes]);
 
-  const canSubmit = Boolean(matchingVariant?._id) && hasAllRequiredSelections && !isLoadingVariants;
+  const canSubmit =
+    Boolean(matchingVariant?._id) &&
+    matchingVariantIsCurrent &&
+    hasAllRequiredSelections &&
+    !isLoadingVariants;
 
   const addToCartHandler = useCallback(async () => {
-    // leading-edge debounce
+    // Keep one verification/add operation in flight at a time.
     if (isBusy) return;
     setIsBusy(true);
-    // Keep the block for 600ms to catch double-taps
-    setTimeout(() => setIsBusy(false), 600);
 
     try {
       const fail = async (message: string) => {
@@ -108,44 +116,23 @@ export const AddToCart: FC<OptionalProductVariantProps> = (props) => {
         return;
       }
 
-      // Only run Line availability check when the variant includes a "product" option.
-      // Some products don't have this attribute; for those, we skip the Line check entirely.
-      const matchingVariantLineProductOption = matchingVariant.options.find(
-        (opt) => opt.attribute?.name?.toLowerCase() === 'product',
-      );
+      const lineCheckResp = await checkProductLineAvail({
+        storefrontProductId: matchingVariant.product,
+        storefrontVariantId: matchingVariant._id,
+      });
 
-      if (matchingVariantLineProductOption) {
-        if (!ctx) {
-          await fail(
-            'Unable to verify production availability right now. Please refresh and try again.',
-          );
-          return;
-        }
+      if (!lineCheckResp?.ok) {
+        await fail(
+          'We could not verify availability for production. Please try again in a moment.',
+        );
+        return;
+      }
 
-        const lineCheckResp = await checkProductLineAvail({
-          matchingVariantLineProductOption,
-          matchingVariant,
-        });
-
-        // Hard gate: if we cannot verify, we do NOT proceed (prevents backend SKU-not-available surprises).
-        if (!lineCheckResp?.ok) {
-          await fail(
-            'We could not verify availability for production. Please try again in a moment.',
-          );
-          return;
-        }
-
-        if (!lineCheckResp.isAvailable) {
-          // Do not auto-correct drift; only inform.
-          const driftHint = lineCheckResp.drift?.suggested?.key
-            ? ` (possible naming drift: ${lineCheckResp.drift.suggested.key.color}/${lineCheckResp.drift.suggested.key.size})`
-            : '';
-
-          await fail(
-            `This exact variant is not available for production right now. Please pick a different color or size.${driftHint}`,
-          );
-          return;
-        }
+      if (!lineCheckResp.isAvailable) {
+        await fail(
+          'This exact variant is not available for production right now. Please pick a different available option.',
+        );
+        return;
       }
 
       addToCart({
@@ -165,12 +152,12 @@ export const AddToCart: FC<OptionalProductVariantProps> = (props) => {
           typeof err === 'string' ? err : err instanceof Error ? err.message : JSON.stringify(err),
       });
     } finally {
+      setIsBusy(false);
       resetVariantOptions();
     }
   }, [
     addToCart,
     canSubmit,
-    ctx,
     isBusy,
     matchingVariant,
     resetVariantOptions,
@@ -208,11 +195,13 @@ export const AddToCart: FC<OptionalProductVariantProps> = (props) => {
       <h3 className='font-bold text-xl text-black text-center inline-block mx-auto'>
         {isLoadingVariants
           ? 'Loading Options…'
-          : !canSubmit
-            ? 'Select Options'
-            : isBusy
-              ? 'Adding…'
-              : 'Add to Cart'}
+          : cleanVariants.length === 0
+            ? 'Unavailable'
+            : !canSubmit
+              ? 'Select Options'
+              : isBusy
+                ? 'Adding…'
+                : 'Add to Cart'}
       </h3>
 
       <svg width='28' height='26' viewBox='0 0 28 26' aria-hidden='true' fill='none'>

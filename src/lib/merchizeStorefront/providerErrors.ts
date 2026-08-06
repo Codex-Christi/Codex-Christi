@@ -101,30 +101,102 @@ export function merchizeErrorStatus(error: unknown) {
   return providerError.status ?? 500;
 }
 
-export async function fetchMerchizeJson<T>(url: string, init?: RequestInit): Promise<T> {
+export type FetchMerchizeJsonOptions = {
+  /** Opt-in request deadline. Existing callers remain unbounded unless they supply this value. */
+  timeoutMs?: number;
+};
+
+function createBoundedRequestSignal(
+  existingSignal: AbortSignal | null | undefined,
+  timeoutMs: number | undefined,
+) {
+  if (timeoutMs === undefined) {
+    return {
+      signal: existingSignal ?? undefined,
+      didTimeout: () => false,
+      cleanup: () => undefined,
+    };
+  }
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError('Merchize request timeout must be a positive finite number.');
+  }
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort(existingSignal?.reason);
+
+  if (existingSignal?.aborted) abortFromCaller();
+  else existingSignal?.addEventListener('abort', abortFromCaller, { once: true });
+
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error('Merchize request deadline exceeded.'));
+  }, Math.floor(timeoutMs));
+
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    cleanup: () => {
+      clearTimeout(timeout);
+      existingSignal?.removeEventListener('abort', abortFromCaller);
+    },
+  };
+}
+
+export async function fetchMerchizeJson<T>(
+  url: string,
+  init?: RequestInit,
+  options: FetchMerchizeJsonOptions = {},
+): Promise<T> {
+  const boundedSignal = createBoundedRequestSignal(init?.signal, options.timeoutMs);
+  const requestInit =
+    options.timeoutMs === undefined ? init : { ...init, signal: boundedSignal.signal };
   let response: Response;
 
   try {
-    response = await fetch(url, init);
+    response = await fetch(url, requestInit);
   } catch (error) {
+    boundedSignal.cleanup();
     throw new MerchizeProviderError({
       url,
       status: null,
-      message: error instanceof Error ? error.message : String(error),
+      message: boundedSignal.didTimeout()
+        ? `Merchize request timed out after ${Math.floor(options.timeoutMs!)}ms: ${url}`
+        : error instanceof Error
+          ? error.message
+          : String(error),
     });
   }
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new MerchizeProviderError({
-      url,
-      status: response.status,
-      statusText: response.statusText,
-      body,
-    });
-  }
+  try {
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new MerchizeProviderError({
+        url,
+        status: response.status,
+        statusText: response.statusText,
+        body,
+      });
+    }
 
-  return (await response.json()) as T;
+    return (await response.json()) as T;
+  } catch (error) {
+    if (error instanceof MerchizeProviderError) throw error;
+    if (boundedSignal.signal?.aborted) {
+      throw new MerchizeProviderError({
+        url,
+        status: null,
+        message: boundedSignal.didTimeout()
+          ? `Merchize request timed out after ${Math.floor(options.timeoutMs!)}ms: ${url}`
+          : error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+    throw error;
+  } finally {
+    boundedSignal.cleanup();
+  }
 }
 
 function formatMerchizeProviderErrorMessage(

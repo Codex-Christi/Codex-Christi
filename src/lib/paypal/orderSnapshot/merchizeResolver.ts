@@ -1,18 +1,10 @@
 import 'server-only';
 
-import {
-  fetchBaseProduct,
-  fetchProductVariants,
-  merchizeAPIKey,
-  merchizeBaseURL,
-} from '@/app/shop/product/[id]/productDetailsSSR';
 import { getDollarMultiplier } from '@/actions/shop/general/currencyConvert';
 import { PAYPAL_CURRENCY_CODES } from '@/datasets/shop_general/paypal_currency_specifics';
 import { getStrictCatalogVariantsBySku } from '@/lib/datasetSearchers/merchize/catalog';
 import { loadExtrasBySku } from '@/lib/datasetSearchers/merchize/shipping.data';
-import { firstStringValue, toMerchizeThumbnailUrl } from '@/lib/merchizeStorefront/imageUrls';
 import { fetchMerchizeJson } from '@/lib/merchizeStorefront/providerErrors';
-import type { ProductOption } from '@/lib/merchizeStorefront/productTypes';
 import {
   CanonicalOrderResolutionError,
   resolveCanonicalOrderSnapshot,
@@ -21,10 +13,10 @@ import {
 } from './resolver';
 import { calculateStrictShippingQuoteUsd } from './strictShipping';
 import type { CanonicalOrderResolutionInput } from './types';
-import {
-  isMerchizeStorefrontProductAvailable,
-  isMerchizeStorefrontVariantAvailable,
-} from './merchizeAvailability';
+import { isMerchizeStorefrontProductAvailable } from './merchizeAvailability';
+import { resolveProviderStorefrontProductCompatibility } from '@/lib/merchizeStorefront/currentProductLineCompatibility';
+import { STRICT_STOREFRONT_PROVIDER_TIMEOUT_MS } from '@/lib/merchizeStorefront/strictLiveProduct';
+import { mapCompatibleMerchizeVariants } from './mapCompatibleMerchizeVariants';
 
 type LiveVariantPriceResponse = {
   data?: {
@@ -35,21 +27,9 @@ type LiveVariantPriceResponse = {
   };
 };
 
-function normalizeSelectedOptions(options: ProductOption[]) {
-  return options
-    .map((option) => {
-      const attributeName = option.attribute?.name;
-      const name =
-        typeof attributeName === 'string' && attributeName.trim()
-          ? attributeName.trim()
-          : option.name?.trim();
-      const value = option.name?.trim() || option.value?.trim();
-      return name && value ? { name, value } : null;
-    })
-    .filter((option): option is { name: string; value: string } => option !== null);
-}
-
 async function fetchCurrentVariantPrices(productId: string) {
+  const merchizeBaseURL = process.env.MERCHIZE_BASE_URL;
+  const merchizeAPIKey = process.env.MERCHIZE_API_KEY;
   if (!merchizeBaseURL || !merchizeAPIKey) {
     throw new CanonicalOrderResolutionError(
       'LIVE_PRICE_UNAVAILABLE',
@@ -61,12 +41,13 @@ async function fetchCurrentVariantPrices(productId: string) {
   let response: LiveVariantPriceResponse;
   try {
     response = await fetchMerchizeJson<LiveVariantPriceResponse>(
-      `${merchizeBaseURL}/product/products/${productId}/variants/search`,
+      `${merchizeBaseURL.replace(/\/$/, '')}/product/products/${encodeURIComponent(productId)}/variants/search`,
       {
         method: 'POST',
         headers: { 'X-API-KEY': merchizeAPIKey },
-        next: { revalidate: 3600 },
+        cache: 'no-store',
       },
+      { timeoutMs: STRICT_STOREFRONT_PROVIDER_TIMEOUT_MS },
     );
   } catch (error) {
     throw new CanonicalOrderResolutionError(
@@ -90,33 +71,27 @@ async function fetchCurrentVariantPrices(productId: string) {
 }
 
 async function resolveMerchizeProduct(productLookup: string): Promise<TrustedProviderProduct> {
-  const [product, variants] = await Promise.all([
-    fetchBaseProduct(productLookup),
-    fetchProductVariants(productLookup),
-  ]);
-  const livePrices = await fetchCurrentVariantPrices(product._id);
+  const providerProduct = await resolveProviderStorefrontProductCompatibility(productLookup, {
+    persist: true,
+  });
+  const product = providerProduct.productMetaData;
+  const variants = providerProduct.productVariants;
+  const productIsAvailable = isMerchizeStorefrontProductAvailable(product);
+  const livePrices = productIsAvailable
+    ? await fetchCurrentVariantPrices(product._id)
+    : new Map<string, number>();
 
   return {
     productId: product._id,
     title: product.title,
-    isAvailable: isMerchizeStorefrontProductAvailable(product),
-    variants: variants.map((variant) => {
-      const livePrice = livePrices.get(variant._id);
-      return {
-        variantId: variant._id,
-        productId: variant.product,
-        sku: variant.sku,
-        sellerSku: variant.sku_seller?.trim() || null,
-        title: variant.title,
-        selectedOptions: normalizeSelectedOptions(variant.options),
-        imageUrl: toMerchizeThumbnailUrl(firstStringValue(variant.image_uris)),
-        unitPriceUsd: livePrice ?? Number.NaN,
-        priceSource: 'live' as const,
-        // The current storefront all-variants response is the positive availability evidence.
-        // Explicit retirement/hiding flags, when returned by Merchize, always fail closed.
-        isAvailable: isMerchizeStorefrontVariantAvailable(variant),
-      };
-    }),
+    isAvailable: productIsAvailable,
+    variants: productIsAvailable
+      ? mapCompatibleMerchizeVariants({
+          variants,
+          livePrices,
+          compatibilityResults: providerProduct.compatibility.results,
+        })
+      : [],
   };
 }
 

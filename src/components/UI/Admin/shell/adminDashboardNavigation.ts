@@ -153,6 +153,15 @@ const pageConfigs: Array<[prefix: string, config: AdminDashboardPageConfig]> = [
     },
   ],
   [
+    '/admin/shop/storefront-data-health/variant-publication-issues',
+    {
+      section: 'shop-storefront-data-health',
+      title: 'Variant Publication Issues',
+      subtitle: 'Manual repair queue and supplier evidence for unsafe storefront variants',
+      searchPlaceholder: 'Search product IDs, variant IDs, SKUs, issue evidence...',
+    },
+  ],
+  [
     '/admin/shop/storefront-data-health',
     {
       section: 'shop-storefront-data-health',

@@ -36,8 +36,9 @@ export function isMerchizeStorefrontProductAvailable(
 }
 
 /**
- * Membership in Merchize's current storefront all-variants response is positive availability
- * evidence. Any explicit inactive/deleted/hidden/non-active state overrides that evidence.
+ * Reject explicit storefront-variant disablement. Passing this predicate proves only that the
+ * seller-store row is not explicitly disabled; `all-variants` membership is identity evidence and
+ * current supplier sellability still requires the separate product-line/catalog reconciliation.
  */
 export function isMerchizeStorefrontVariantAvailable(
   variant: MerchizeVariantAvailabilityEvidence,

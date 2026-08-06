@@ -84,10 +84,15 @@ export const ProductDetailsProvider: FC<ProductDetailsProps> = ({
         const json = (await res.json()) as {
           data?: ProductVariantsInterface['data'];
           error?: string;
+          verificationIncomplete?: boolean;
         };
 
         if (!res.ok || !Array.isArray(json.data)) {
           throw new Error(json.error || 'Unable to load product options.');
+        }
+
+        if (json.verificationIncomplete && json.data.length === 0) {
+          throw new Error('Product availability could not be verified. Please try again.');
         }
 
         if (cancelled) return;

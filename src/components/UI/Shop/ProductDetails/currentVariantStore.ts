@@ -81,6 +81,33 @@ export function hasRequiredVariantSelections(
   });
 }
 
+export function findMatchingVariantForSelections(
+  variants: Variants,
+  selections: VariantSelectionState,
+): Variant | undefined {
+  if (!Array.isArray(variants) || variants.length === 0) return undefined;
+
+  const requiredAttributes = getRequiredVariantAttributes(variants);
+  if (!requiredAttributes.length) {
+    return variants.length === 1 ? variants[0] : undefined;
+  }
+  if (!hasRequiredVariantSelections(requiredAttributes, selections)) {
+    return undefined;
+  }
+
+  return variants.find((variant) => {
+    const map = buildVariantValueMap(variant);
+
+    return requiredAttributes.every((attrName) => {
+      const selected = selections[attrName];
+      if (!selected) return false;
+
+      const variantVal = map[attrName];
+      return (variantVal ?? '').toLowerCase() === selected.toLowerCase();
+    });
+  });
+}
+
 export const useCurrentVariant = create<CurrentVariantStore>()(
   subscribeWithSelector((set, get) => ({
     matchingVariant: null,
@@ -132,34 +159,12 @@ export const useCurrentVariant = create<CurrentVariantStore>()(
 
     findMatchingVariant: (variants: Variants) => {
       if (!Array.isArray(variants) || variants.length === 0) {
-        console.error('Invalid variants passed to findMatchingVariant');
         set((s) => ({ ...s, matchingVariant: null }));
         return undefined;
       }
 
       const selections = get().currentVariantOptions;
-      const requiredAttributes = getRequiredVariantAttributes(variants);
-
-      if (
-        !requiredAttributes.length ||
-        !hasRequiredVariantSelections(requiredAttributes, selections)
-      ) {
-        set((s) => ({ ...s, matchingVariant: null }));
-        return undefined;
-      }
-
-      const matched = variants.find((variant) => {
-        const map = buildVariantValueMap(variant);
-
-        return requiredAttributes.every((attrName) => {
-          const selected = selections[attrName];
-          if (!selected) return false;
-
-          const variantVal = map[attrName];
-
-          return (variantVal ?? '').toLowerCase() === selected.toLowerCase();
-        });
-      });
+      const matched = findMatchingVariantForSelections(variants, selections);
 
       set((s) => ({ ...s, matchingVariant: matched ?? null }));
       return matched;
@@ -170,7 +175,7 @@ export const useCurrentVariant = create<CurrentVariantStore>()(
 // 🔄 Auto-match when options change (with shallow equality to prevent noisy triggers)
 export function setupVariantAutoMatching(variants: Variants) {
   if (!Array.isArray(variants) || variants.length === 0) {
-    console.error('Invalid variants passed to setupVariantAutoMatching');
+    useCurrentVariant.getState().setMatchingVariant(null);
     return () => {};
   }
 
@@ -179,12 +184,14 @@ export function setupVariantAutoMatching(variants: Variants) {
   const syncMatchingVariant = (currentOptions: VariantSelectionState) => {
     const state = useCurrentVariant.getState();
 
+    if (!requiredAttributes.length) {
+      state.setMatchingVariant(variants.length === 1 ? variants[0] : null);
+      return;
+    }
+
     // If no active selection or not all required attributes are selected yet,
     // we do not attempt a match and clear any previous match.
-    if (
-      !requiredAttributes.length ||
-      !hasRequiredVariantSelections(requiredAttributes, currentOptions)
-    ) {
+    if (!hasRequiredVariantSelections(requiredAttributes, currentOptions)) {
       if (state.matchingVariant !== null) {
         state.setMatchingVariant(null);
       }

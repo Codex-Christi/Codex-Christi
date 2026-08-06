@@ -18,8 +18,17 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/UI/primitives/alert-dialog';
+import {
+  getCartItemAvailability,
+  type CartItemAvailabilityStatus,
+  type CartItemAvailabilityMap,
+} from './cartAvailability';
 
-const CartItems: FC<{ cartItems: CartVariant[] }> = ({ cartItems }) => {
+const CartItems: FC<{
+  cartItems: CartVariant[];
+  availabilityByVariantId: CartItemAvailabilityMap;
+  onAvailabilityChange?: (variantId: string, status: CartItemAvailabilityStatus) => void;
+}> = ({ cartItems, availabilityByVariantId, onAvailabilityChange }) => {
   const { removeFromCart } = useCartStore();
 
   const [pendingRemoveId, setPendingRemoveId] = useState<string | null>(null);
@@ -50,8 +59,7 @@ const CartItems: FC<{ cartItems: CartVariant[] }> = ({ cartItems }) => {
       onClick={() => setPendingRemoveId(variantId)}
     >
       <Trash2 className='h-4 w-4' />
-      {/* Text only on larger screens to avoid truncation on tight widths */}
-      <span className='hidden lg:inline'>Remove</span>
+      <span>Remove</span>
     </Button>
   );
 
@@ -60,21 +68,29 @@ const CartItems: FC<{ cartItems: CartVariant[] }> = ({ cartItems }) => {
       {cartItems.map((cartItem) => {
         const { itemDetail: variant, title, quantity } = cartItem;
         const productTitle = title;
-        const { image, retail_price, _id, options, product: parentID } = variant;
+        const { image, retail_price, options, product: parentID } = variant;
+        const availability = getCartItemAvailability(availabilityByVariantId, cartItem.variantId);
+        const canIncreaseQuantity = availability.status === 'available';
+        const isUnavailable = availability.status === 'unavailable';
+        const isUnverified = availability.status === 'unverified';
+        const isChecking = availability.status === 'checking';
+        const productLookupKey = parentID || cartItem.slug;
+        const productHref = `/shop/product/${encodeURIComponent(productLookupKey)}`;
 
         const lineTotal = retail_price * quantity;
 
         return (
           <div
-            key={_id}
+            key={cartItem.variantId}
             className={`bg-transparent px-0 md:px-4 my-4 rounded-l w-full mx-auto
             grid grid-cols-3 md:grid-cols-4 xl:grid-cols-6 gap-2 md:gap-3 select-none 
             transition-opacity duration-200
-            ${removingId === _id ? 'opacity-0' : 'opacity-100'}`}
+            ${isUnavailable || isUnverified ? 'rounded-xl border border-amber-300/40 py-3' : ''}
+            ${removingId === cartItem.variantId ? 'opacity-0' : 'opacity-100'}`}
           >
             {/* Item Image */}
             {image && (
-              <CustomShopLink href={`/shop/product/${parentID}`}>
+              <CustomShopLink href={productHref}>
                 <Image
                   src={image}
                   className='rounded-xl hover:cursor-pointer'
@@ -90,11 +106,35 @@ const CartItems: FC<{ cartItems: CartVariant[] }> = ({ cartItems }) => {
               className='text-left flex flex-col justify-around col-span-2 
               md:col-span-2 xl:col-span-3 hover:cursor-pointer'
             >
-              <CustomShopLink href={`/shop/product/${parentID}`}>
+              <CustomShopLink href={productHref}>
                 <h3 className='text-lg font-semibold hover:underline underline-offset-8'>
                   {productTitle}
                 </h3>
               </CustomShopLink>
+
+              {isUnavailable && (
+                <div role='status' className='mt-2 space-y-1 text-sm'>
+                  <p className='font-bold text-amber-200'>No longer available</p>
+                  <CustomShopLink
+                    href={productHref}
+                    className='inline-flex font-semibold text-blue-200 underline underline-offset-2'
+                  >
+                    Choose another available option
+                  </CustomShopLink>
+                </div>
+              )}
+
+              {isUnverified && (
+                <p role='status' className='mt-2 text-sm font-semibold text-amber-200'>
+                  Availability could not be verified. Please refresh before checkout.
+                </p>
+              )}
+
+              {isChecking && (
+                <p role='status' className='mt-2 text-sm text-white/70'>
+                  Checking availability…
+                </p>
+              )}
 
               <h4 className='text-base text-white'>
                 Price: <GlobalProductPrice usdAmount={retail_price} /> (each)
@@ -109,8 +149,13 @@ const CartItems: FC<{ cartItems: CartVariant[] }> = ({ cartItems }) => {
             {/* Mobile: Quantity, Delete & Total on the right */}
             <div className='col-span-2 col-start-2 flex flex-col items-end gap-2 md:hidden'>
               <div className='flex items-center justify-end gap-2'>
-                <ItemQuantityComponent className='flex' cartItem={cartItem} />
-                {renderRemoveButton(_id)}
+                <ItemQuantityComponent
+                  className='flex'
+                  cartItem={cartItem}
+                  disableIncrement={!canIncreaseQuantity}
+                  onAvailabilityChange={onAvailabilityChange}
+                />
+                {renderRemoveButton(cartItem.variantId)}
               </div>
               <h3 className='text-[1.1rem] font-semibold text-right'>
                 Total: <GlobalProductPrice usdAmount={lineTotal} />
@@ -124,8 +169,13 @@ const CartItems: FC<{ cartItems: CartVariant[] }> = ({ cartItems }) => {
 
               {/* Quantity + Delete (desktop and up) */}
               <div className='flex items-center justify-end gap-2'>
-                <ItemQuantityComponent className='flex' cartItem={cartItem} />
-                {renderRemoveButton(_id)}
+                <ItemQuantityComponent
+                  className='flex'
+                  cartItem={cartItem}
+                  disableIncrement={!canIncreaseQuantity}
+                  onAvailabilityChange={onAvailabilityChange}
+                />
+                {renderRemoveButton(cartItem.variantId)}
               </div>
             </section>
 

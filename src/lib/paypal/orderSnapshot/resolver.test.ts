@@ -41,6 +41,8 @@ function dependencies(
         {
           variantId: 'trusted-variant',
           productId: 'trusted-product',
+          supplierProductId: 'supplier-product',
+          supplierVariantId: 'supplier-variant',
           sku: 'TRUSTED-SKU',
           sellerSku: 'TRUSTED-SELLER-SKU',
           title: 'Medium',
@@ -238,6 +240,34 @@ test('rejects missing catalog proof for a provider-resolved SKU', async () => {
   );
 });
 
+test('rejects catalog proof whose supplier product or variant identity conflicts', async () => {
+  for (const identityOverride of [
+    { supplierProductId: 'other-supplier-product' },
+    { supplierVariantId: 'other-supplier-variant' },
+  ]) {
+    await assert.rejects(
+      () =>
+        resolveCanonicalOrderSnapshot(
+          input,
+          dependencies({
+            resolveCatalogVariants: async () => [
+              {
+                sku: 'TRUSTED-SKU',
+                supplierProductId: 'supplier-product',
+                supplierVariantId: 'supplier-variant',
+                catalogRow,
+                ...identityOverride,
+              },
+            ],
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof CanonicalOrderResolutionError &&
+        error.code === 'CATALOG_VARIANT_IDENTITY_MISMATCH',
+    );
+  }
+});
+
 test('rejects unavailable live pricing', async () => {
   const deps = dependencies();
   const original = deps.resolveProduct;
@@ -289,8 +319,7 @@ test('rejects oversized carts before any provider lookup', async () => {
   await assert.rejects(
     () => resolveCanonicalOrderSnapshot({ ...input, selections }, deps),
     (error: unknown) =>
-      error instanceof CanonicalOrderResolutionError &&
-      error.code === 'INVALID_ORDER_SELECTION',
+      error instanceof CanonicalOrderResolutionError && error.code === 'INVALID_ORDER_SELECTION',
   );
   assert.equal(productCalls, 0);
 });
@@ -317,8 +346,7 @@ test('rejects duplicate lines whose aggregate quantity exceeds the line limit', 
         dependencies(),
       ),
     (error: unknown) =>
-      error instanceof CanonicalOrderResolutionError &&
-      error.code === 'INVALID_ORDER_SELECTION',
+      error instanceof CanonicalOrderResolutionError && error.code === 'INVALID_ORDER_SELECTION',
   );
 });
 
@@ -347,6 +375,8 @@ test('bounds concurrent trusted-product resolution work', async () => {
           {
             variantId: `variant-${index}`,
             productId: lookup,
+            supplierProductId: 'supplier-product',
+            supplierVariantId: 'supplier-variant',
             sku: 'TRUSTED-SKU',
             sellerSku: null,
             title: `Variant ${index}`,

@@ -2,9 +2,22 @@
 
 import { useCartStore } from '@/stores/shop_stores/cartStore';
 import type { CartVariant } from '@/stores/shop_stores/cartStore';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
 import { hydrateCartDisplayFromMerchizeOfflineCatalog } from '@/actions/shop/cart/hydrateCartDisplayFromMerchizeOfflineCatalog';
+import {
+  createCartAvailabilityMap,
+  getCartVerificationIdentity,
+  hasCheckoutBlockingCartItems,
+  type CartItemAvailabilityMap,
+  type CartItemAvailabilityStatus,
+} from './cartAvailability';
+
+type CartDisplayState = {
+  cartIdentity: string | null;
+  cartItems: CartVariant[];
+  availabilityByVariantId: CartItemAvailabilityMap;
+};
 
 // Dynamic Imports
 const CartEmptyComponent = dynamic(
@@ -25,16 +38,50 @@ const CartMainComponent = () => {
   // Hooks
   // Hooks
   const { variants } = useCartStore((state) => state);
-  const [displayVariants, setDisplayVariants] = useState<CartVariant[]>([]);
+  const cartIdentity = useMemo(() => getCartVerificationIdentity(variants), [variants]);
+  const [cartDisplayState, setCartDisplayState] = useState<CartDisplayState>({
+    cartIdentity: null,
+    cartItems: [],
+    availabilityByVariantId: {},
+  });
   const isCartEmpty = useMemo(() => variants.length === 0, [variants.length]);
-  const cartItemsForDisplay = useMemo(
-    () => (isCartEmpty ? [] : displayVariants.length > 0 ? displayVariants : variants),
-    [displayVariants, isCartEmpty, variants],
+  const displayStateIsCurrent = cartDisplayState.cartIdentity === cartIdentity;
+  const availabilityByVariantId = useMemo(
+    () =>
+      displayStateIsCurrent
+        ? cartDisplayState.availabilityByVariantId
+        : createCartAvailabilityMap(variants, 'checking'),
+    [cartDisplayState.availabilityByVariantId, displayStateIsCurrent, variants],
   );
-
-  useEffect(() => {
-    console.log(variants);
-  }, [variants]);
+  const cartItemsForDisplay = useMemo(
+    () =>
+      isCartEmpty
+        ? []
+        : displayStateIsCurrent && cartDisplayState.cartItems.length === variants.length
+          ? cartDisplayState.cartItems
+          : variants,
+    [cartDisplayState.cartItems, displayStateIsCurrent, isCartEmpty, variants],
+  );
+  const checkoutBlocked = useMemo(
+    () => hasCheckoutBlockingCartItems(variants, availabilityByVariantId),
+    [availabilityByVariantId, variants],
+  );
+  const handleAvailabilityChange = useCallback(
+    (variantId: string, status: CartItemAvailabilityStatus) => {
+      setCartDisplayState((current) =>
+        current.cartIdentity === cartIdentity
+          ? {
+              ...current,
+              availabilityByVariantId: {
+                ...current.availabilityByVariantId,
+                [variantId]: { status },
+              },
+            }
+          : current,
+      );
+    },
+    [cartIdentity],
+  );
 
   useEffect(() => {
     let active = true;
@@ -42,18 +89,28 @@ const CartMainComponent = () => {
     if (variants.length === 0) return;
 
     hydrateCartDisplayFromMerchizeOfflineCatalog(variants)
-      .then((hydratedVariants) => {
-        if (active) setDisplayVariants(hydratedVariants);
+      .then(({ cartItems, availabilityByVariantId: availability }) => {
+        if (!active) return;
+        setCartDisplayState({
+          cartIdentity,
+          cartItems,
+          availabilityByVariantId: availability,
+        });
       })
       .catch((error) => {
         console.warn('[CartMainComponent] Offline catalog cart hydration failed:', error);
-        if (active) setDisplayVariants(variants);
+        if (!active) return;
+        setCartDisplayState({
+          cartIdentity,
+          cartItems: variants,
+          availabilityByVariantId: createCartAvailabilityMap(variants, 'unverified'),
+        });
       });
 
     return () => {
       active = false;
     };
-  }, [variants]);
+  }, [cartIdentity, variants]);
 
   // JSX
   return (
@@ -79,13 +136,19 @@ const CartMainComponent = () => {
         {!isCartEmpty && variants && (
           <div className='flex flex-col gap-8 max-h-[90vh] px-5 overflow-y-auto scrollbar'>
             {/* All Cart Items */}
-            <CartItems cartItems={cartItemsForDisplay} />
+            <CartItems
+              cartItems={cartItemsForDisplay}
+              availabilityByVariantId={availabilityByVariantId}
+              onAvailabilityChange={handleAvailabilityChange}
+            />
           </div>
         )}
       </div>
 
       {/* Conatiner for Order Summary */}
-      {!isCartEmpty && variants && <OrderSummary cartItemsOverride={cartItemsForDisplay} />}
+      {!isCartEmpty && variants && (
+        <OrderSummary cartItemsOverride={cartItemsForDisplay} checkoutBlocked={checkoutBlocked} />
+      )}
     </div>
   );
 };

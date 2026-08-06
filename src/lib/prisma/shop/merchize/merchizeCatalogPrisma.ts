@@ -47,9 +47,27 @@ declare global {
 
 let merchizeCatalogPrismaSingleton: PrismaClient | undefined;
 
+function supportsCurrentCatalogSchema(client: PrismaClient) {
+  // A generated Prisma client can survive a Next.js hot reload through globalThis. If the schema
+  // changed while `next dev` was running, discard that pre-generation client so newly added model
+  // delegates are available without requiring a manual server restart.
+  return (
+    typeof (client as unknown as Record<string, unknown>).storefrontVariantCompatibility ===
+    'object'
+  );
+}
+
 export function getMerchizeCatalogPrisma() {
   const cachedClient = globalThis.merchizeCatalogPrisma ?? merchizeCatalogPrismaSingleton;
-  if (cachedClient) return cachedClient;
+  if (cachedClient && supportsCurrentCatalogSchema(cachedClient)) return cachedClient;
+
+  if (cachedClient) {
+    globalThis.merchizeCatalogPrisma = undefined;
+    merchizeCatalogPrismaSingleton = undefined;
+    void cachedClient.$disconnect().catch((error) => {
+      console.warn('Failed to disconnect an outdated Merchize catalog Prisma client:', error);
+    });
+  }
 
   try {
     const dbUrl = resolveDbUrl();

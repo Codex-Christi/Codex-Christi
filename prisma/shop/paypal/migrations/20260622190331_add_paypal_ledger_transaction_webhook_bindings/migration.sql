@@ -1,0 +1,2 @@
+-- RenameIndex
+ALTER INDEX "PaypalLedgerTransactionWebhookBinding_paypalPaymentMode_isActiv" RENAME TO "PaypalLedgerTransactionWebhookBinding_paypalPaymentMode_isA_idx";

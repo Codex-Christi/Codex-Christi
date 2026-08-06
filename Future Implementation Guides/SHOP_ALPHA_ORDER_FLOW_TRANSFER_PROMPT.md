@@ -19,9 +19,11 @@ The release guide is canonical for priority and resolved product decisions. The 
 domain references. If an older guide says a different item is "next" or contains an unresolved
 decision already resolved by the release guide, follow the release guide.
 
-Current checkpoint: 2026-08-06. P0.2 canonical-order implementation and local repository
-verification are complete. No configured database was mutated. Migration deployment and deployed
-sandbox/E2E verification are still pending, so do not mark its release gates passed yet.
+Current checkpoint: 2026-08-06. The P0.2 snapshot/payment foundation and local current-sellability
+correction are complete. Merchize `all-variants` is identity only; availability now requires exact
+current Product-line/options proof or completed-current-catalog SKU proof, with storefront and
+supplier SKU namespaces kept separate. Local SQLite received the additive compatibility update, but
+the PayPal ledger migration and deployed sandbox/E2E verification remain pending.
 
 ## Product target
 
@@ -71,9 +73,10 @@ The alpha must support a smooth real-customer flow:
   email/user linking flow.
 - Keep alpha disclosure non-blocking: one small notice on signup and one on the shop homepage. Do
   not add a checkbox, modal, versioned dismissal, or waitlist query-state pipeline.
-- No arbitrary small SKU allowlist. Any offered variant can sell only when server product, mapping,
-  price, and the current shipping calculation can be resolved from trusted server data. This is an
-  order-integrity check, not a new destination or tax policy.
+- No arbitrary small SKU allowlist. `all-variants` membership is storefront identity only. Any
+  offered variant can sell only after exact current product-line/catalog reconciliation, price, and
+  shipping resolve from trusted server data. Storefront and supplier SKU namespaces remain
+  separate. This is an order-integrity check, not a new destination or tax policy.
 - Preserve the existing multi-currency checkout and PayPal behavior. The canonical snapshot records
   the exact server-resolved currency and amounts; the alpha is not restricted to USD.
 - The current PayPal setup does not provide tax-charging capability. Do not calculate, add, collect,
@@ -105,11 +108,27 @@ The alpha must support a smooth real-customer flow:
   snapshot.
 - P0.2 extends the existing `PaypalIntent` ledger; it adds no standalone order database/table and no
   alpha-participation persistence.
-- Trusted Merchize publication state rejects explicitly inactive/hidden/deleted/private/taken-down,
-  draft/retired, or unapproved selections without creating a new product/SKU allowlist. Selection
-  input is bounded to 25 rows, 128 characters per ID, 25 units per merged line, and 100 total units;
-  duplicate selectors are merged/rechecked, unique products resolve once with at most four workers,
-  and catalog SKUs resolve in one strict batch.
+- Trusted Merchize publication state still rejects explicitly inactive/hidden/deleted/private/
+  taken-down/draft/retired/unapproved selections, but `all-variants` membership does not prove
+  sellability. With a `Product` option, require one exact current product-line name plus complete
+  option-map match and use the resolved supplier SKU. Without a `Product` option, require exact
+  current SKU membership from a completed supplier-catalog generation. Missing, ambiguous, partial,
+  stale, or unverified evidence fails closed; storefront and supplier SKU namespaces stay separate.
+  Compatibility reads time out after 15 seconds. The same verdict fails closed at public variant
+  display, add-to-cart, stale-cart hydration/revalidation, quantity increase, checkout entry, direct
+  checkout, and PayPal intent creation. A stale cart row remains visible and removable but cannot be
+  increased or purchased. Base-product, `all-variants`, and current-price trust reads are strict
+  `no-store` calls; storefront snapshots remain display-only fallback. Exact product-line supplier
+  product/variant IDs and SKU must equal the completed catalog row. Strict catalog proof requires
+  both parent and variant generation IDs to equal `SyncState.lastCompletedRunId`, with bounded writes
+  and generation finalization fenced inside the active lease transaction.
+- Selection input remains bounded to 25 rows, 128 characters per ID, 25 units per merged line, and
+  100 total units; duplicate selectors are merged/rechecked and provider work remains concurrency-
+  bounded. The correction must preserve those request-amplification limits.
+- Admin/scheduled published-variant audits globally trim, dedupe, and sort discovered product IDs,
+  then await deterministic chunks of at most 100 sequentially. This audits sets above 100 without
+  exceeding the underlying four-product-worker bound and aggregates all chunk counts, results, and
+  product errors.
 - The PayPal ledger has the additive `canonicalOrderSnapshot`,
   `canonicalOrderSnapshotVersion`, and `canonicalOrderSnapshotHash` fields plus migration
   `20260806000000_add_canonical_order_snapshot`. Only an all-null triple is legacy; partial or
@@ -128,21 +147,33 @@ The alpha must support a smooth real-customer flow:
   completed PayPal capture, and a difference from the canonical total is flagged for review.
 - P0.2 preserves existing currencies and destination behavior. The snapshot and PayPal request
   contain merchandise plus shipping only; there is no tax amount or tax line.
-- Local P0.2 checks pass: the repository source test suite for this isolated change (132 tests),
-  TypeScript, ESLint, checked-in Prisma 7.8 generated-client field/type wiring, dev/prod schema
-  validation,
-  disposable-PostgreSQL migration smoke test, production webpack build, and diff checks. No
-  configured database was changed.
-- Deployment is blocked on migration handling. Production has only
-  `20260806000000_add_canonical_order_snapshot` pending. Development has that migration pending plus
-  a pre-existing history divergence: the database has remote-only
-  `20260622190331_add_paypal_ledger_transaction_webhook_bindings`, while the repository has
-  `20260622190000_add_paypal_ledger_transaction_webhook_bindings`. Reconcile the development history
-  before deploying the new migration.
-- The immediate operational action is migration reconciliation/deployment followed by deployed
-  sandbox/E2E verification. P0.3 is the next implementation-scope item and remains a read-only
-  documentation/audit pass over existing destination behavior; it authorizes no code, policy,
-  eligibility, currency, customer-copy, or tax changes.
+- The correction is locally verified: the additive local SQLite `db push` completed; a complete
+  current-catalog generation contains 905 products and 19,885 variants; the pre-final live baseline
+  audit returned 141 total, 138 available, 3 unavailable, and 0 unverified across 13 products; and
+  the final dual-source catalog gate has six focused regressions. The full local suite passed 195/195
+  tests together with TypeScript, targeted ESLint, the production webpack build, and diff checks. A
+  repeat live audit under the final gate and deployed sandbox/E2E remain pending. The repair run sent
+  no notification email.
+- Only confirmed current drift/unavailability creates or updates a per-variant catalog-health
+  incident. Provider timeouts/outages and incomplete or otherwise unverified evidence remain one
+  aggregate operational condition and do not fan out into incidents. Confirmed incidents accumulate
+  in the detailed Storefront Data Health admin queue. P0.2 does not add a catalog email/outbox path;
+  any later outbound escalation belongs with the explicitly scoped notification work.
+- The main `/admin/shop/storefront-data-health` page keeps only compact incident counts. Detailed
+  repair evidence is isolated at
+  `/admin/shop/storefront-data-health/variant-publication-issues` in responsive, collapsed-per-issue
+  rows with server-side pagination, so every open incident remains reachable while catalog statistics
+  and SKU lookup stay easy to reach. A storage failure is shown as unavailable counts, never as zero.
+- The apparent development migration-name divergence was a lost legitimate migration file.
+  Development has both the original `20260622190000_add_paypal_ledger_transaction_webhook_bindings`
+  migration and the later `20260622190331_add_paypal_ledger_transaction_webhook_bindings` index
+  rename recorded successfully. The exact rename SQL is restored in the repository with checksum
+  `2356add3eeef5a0e2c45d179244f99c262c4658590beb55116243f0c7787df3e`; do not rewrite database
+  history or use `migrate resolve`.
+- The restored 13-migration chain passes on disposable PostgreSQL. Read-only status shows only the
+  canonical-snapshot migration pending in development and the restored index rename as production's
+  first pending migration. The immediate action is explicitly approved development migration
+  deployment followed by deployed PayPal sandbox/E2E. P0.3 begins afterward as a read-only trace.
 
 Remaining release gaps after that checkpoint include:
 
@@ -155,12 +186,12 @@ Remaining release gaps after that checkpoint include:
 
 ## Required first implementation order
 
-1. Reconcile the pre-existing development migration-history name divergence, then apply the checked
-   additive migration to the intended development target. Do not rewrite or deploy migration
-   history blindly.
-2. Run the deployed PayPal sandbox/E2E P0.2 acceptance cases, then deploy the same migration to the
-   production target through the normal reviewed rollout. Keep release gates unchecked until their
-   deployed evidence exists.
+1. With explicit database approval, run `prisma migrate deploy` against development. The index
+   rename is already recorded there, so only the canonical-snapshot migration should apply. Run the
+   deployed PayPal sandbox/E2E P0.2 acceptance cases afterward.
+2. After development evidence passes, deploy production through the normal reviewed rollout.
+   Production must apply the restored index rename first and the canonical-snapshot migration
+   second. Keep release gates unchecked until their deployed evidence exists.
 3. Perform P0.3 as documentation and read-only code/data tracing only. Record existing destination
    behavior and confirm P0.2 did not change coverage, currencies, or customer copy. Do not modify
    destination eligibility, add geographic blocks, introduce a policy table, or add tax behavior.
@@ -200,6 +231,18 @@ Do not jump to Merchize webhook implementation until the P0 gates in the release
   merchandise plus shipping only.
 - Rejecting a missing SKU or unsafe fabricated shipping fallback is an order-integrity check, not a
   new destination allowlist.
+- Treat storefront `all-variants` rows as identity only. For variants with a `Product` option,
+  require one exact current product-line name plus complete option-map match, then require its
+  supplier product ID, supplier variant ID, and SKU to match the latest completed catalog generation.
+  For variants without one, require exact current SKU membership from that completed generation.
+- Keep storefront and supplier IDs/SKUs in separate namespaces. Never substitute, assume equality,
+  accept a fuzzy/nearest option, or treat partial provider data as positive sellability evidence.
+- Bound compatibility reads to 15 seconds and apply the same fail-closed verdict at public variant
+  display, add-to-cart, cart hydration/revalidation, quantity increase, checkout entry, direct
+  checkout, and PayPal intent creation. Keep a stale row visible/removable. Record a per-variant
+  incident only for confirmed drift; keep provider outages/timeouts and incomplete/unverified reads
+  aggregate. Use the persistent Storefront Data Health queue for admin action; do not add catalog
+  email or PayPal-outbox coupling in P0.2.
 - Pre-P0.2 compatibility applies only when canonical snapshot, version, and hash are all null.
   Partial, invalid, or mismatched metadata is corruption and must not fall back to cart data.
 - Treat any future destination-policy change as separate work requiring explicit product direction,
@@ -211,9 +254,10 @@ Do not jump to Merchize webhook implementation until the P0 gates in the release
 1. Run `git status --short` and inspect recent commits.
 2. Re-scan the current implementations before editing because other agents may have changed files.
 3. Compare the code against the release guide's "Current Codebase Checkpoint."
-4. Treat local P0.2 verification as complete. Resolve/deploy the migration and run deployed
-   sandbox/E2E verification as operational gates; the next implementation-scope item is the P0.3
-   read-only destination-behavior documentation/audit, not a policy or checkout-code change.
+4. Treat the current-sellability code and local automated verification as complete. Repeat the live
+   compatibility audit under the final dual-source gate, then confirm explicit approval and deploy
+   the pending canonical-snapshot migration to development. Run deployed PayPal sandbox/E2E before
+   beginning the P0.3 read-only trace.
 5. Before editing, state the exact files and behavior being changed.
 6. Use existing patterns, preserve unrelated dirty changes, add risk-proportionate tests, and verify
    migrations against both dev and production branches when schema changes are involved.

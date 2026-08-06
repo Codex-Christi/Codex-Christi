@@ -26,6 +26,8 @@ type ItemDetail = {
   is_default: boolean;
   sku?: string;
   sku_seller?: string;
+  /** Server-verified fulfillment SKU; never accepted from browser input without revalidation. */
+  supplierSku?: string;
   title: string;
   weight?: number;
   options: VariantOption[] | ProductVariantOptions;

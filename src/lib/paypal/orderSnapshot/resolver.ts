@@ -22,16 +22,8 @@ export const CANONICAL_ORDER_RESOLUTION_LIMITS = Object.freeze({
 
 const selectionSchema = z
   .object({
-    productId: z
-      .string()
-      .trim()
-      .min(1)
-      .max(CANONICAL_ORDER_RESOLUTION_LIMITS.maxIdentifierLength),
-    variantId: z
-      .string()
-      .trim()
-      .min(1)
-      .max(CANONICAL_ORDER_RESOLUTION_LIMITS.maxIdentifierLength),
+    productId: z.string().trim().min(1).max(CANONICAL_ORDER_RESOLUTION_LIMITS.maxIdentifierLength),
+    variantId: z.string().trim().min(1).max(CANONICAL_ORDER_RESOLUTION_LIMITS.maxIdentifierLength),
     quantity: z
       .number()
       .int()
@@ -66,6 +58,7 @@ export type CanonicalOrderResolutionErrorCode =
   | 'VARIANT_PRODUCT_MISMATCH'
   | 'MISSING_TRUSTED_SKU'
   | 'MISSING_CATALOG_VARIANT'
+  | 'CATALOG_VARIANT_IDENTITY_MISMATCH'
   | 'LIVE_PRICE_UNAVAILABLE'
   | 'INVALID_CURRENCY_RESOLUTION'
   | 'UNSAFE_SHIPPING_FALLBACK'
@@ -93,6 +86,8 @@ export class CanonicalOrderResolutionError extends Error {
 export type TrustedProviderVariant = {
   variantId: string;
   productId: string;
+  supplierProductId: string;
+  supplierVariantId: string;
   sku: string;
   sellerSku: string | null;
   title: string;
@@ -311,6 +306,12 @@ function resolveLineSeeds(
         `Variant ${variant.variantId} has no server-resolved Merchize SKU.`,
       );
     }
+    if (!variant.supplierProductId?.trim() || !variant.supplierVariantId?.trim()) {
+      throw new CanonicalOrderResolutionError(
+        'MISSING_CATALOG_VARIANT',
+        `Variant ${variant.variantId} has incomplete supplier identity proof.`,
+      );
+    }
     if (
       variant.priceSource !== 'live' ||
       !Number.isFinite(variant.unitPriceUsd) ||
@@ -360,16 +361,13 @@ async function mapWithConcurrency<Input, Output>(
   const results = new Array<Output>(values.length);
   let nextIndex = 0;
 
-  const workers = Array.from(
-    { length: Math.min(concurrency, values.length) },
-    async () => {
-      while (nextIndex < values.length) {
-        const index = nextIndex;
-        nextIndex += 1;
-        results[index] = await mapper(values[index]);
-      }
-    },
-  );
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(values[index]);
+    }
+  });
 
   await Promise.all(workers);
   return results;
@@ -504,6 +502,18 @@ export async function resolveCanonicalOrderSnapshot(
       throw new CanonicalOrderResolutionError(
         'MISSING_CATALOG_VARIANT',
         `Server SKU ${sku} could not be proven against the Merchize catalog.`,
+      );
+    }
+  }
+  for (const line of lineSeeds) {
+    const catalog = catalogBySku.get(line.variant.sku)!;
+    if (
+      catalog.supplierProductId !== line.variant.supplierProductId ||
+      catalog.supplierVariantId !== line.variant.supplierVariantId
+    ) {
+      throw new CanonicalOrderResolutionError(
+        'CATALOG_VARIANT_IDENTITY_MISMATCH',
+        `Server SKU ${line.variant.sku} resolved to conflicting supplier identity.`,
       );
     }
   }

@@ -68,7 +68,7 @@ Alpha is release-ready only when all of the following are true:
 | Participation           | Every completed ordinary account signup is implicitly part of the alpha waitlist. Do not add a separate enrollment record, acknowledgement, user-linking flow, or invite approval gate.                                                                                                     |
 | Alpha disclosure        | Use small informational notices on the signup page and shop homepage. They do not block signup, require dismissal, or create persisted state.                                                                                                                                               |
 | Auth evolution          | Preserve the core signup → OTP → login contract. Independently justified auth enhancements are allowed, but they must not be coupled to alpha participation or replace the order-flow priority.                                                                                             |
-| Catalog eligibility     | Do not create an arbitrary small hardcoded allowlist. Every offered variant may be sold when its product, SKU mapping, live server price, and current shipping calculation can be resolved from trusted server data. This is an order-integrity check, not a new destination or tax policy. |
+| Catalog eligibility     | Do not create an arbitrary small hardcoded allowlist. A storefront `all-variants` row proves identity only, not current sellability. A variant may be offered only after exact, unambiguous reconciliation to the current product-line/catalog source, live server price, and current shipping calculation. Storefront and supplier SKU namespaces remain separate. This is an order-integrity check, not a new destination or tax policy. |
 | Currency behavior       | Preserve the existing multi-currency checkout and PayPal behavior. P0.2 records the exact server-resolved currency and amounts used for an order; it does not restrict the alpha to USD.                                                                                                    |
 | PayPal tax capability   | The current PayPal setup does not provide tax-charging capability. The alpha must not calculate, add, collect, or pass a tax amount or tax line to PayPal.                                                                                                                                  |
 | Django scope            | Keep Django at its current boundary: order-intent verification, payment save, and initial Merchize order preparation/handoff. New address, contact, confirmation-access, notification, and lifecycle work is Next.js-owned.                                                                 |
@@ -89,19 +89,62 @@ Alpha is release-ready only when all of the following are true:
 
 ### What "validated catalog" means
 
-It does not mean choosing a tiny list by hand. It means the server can prove all of this for the
-selected variant using the checkout behavior that already exists:
+It does not mean choosing a tiny list by hand. Merchize can continue returning storefront variants
+after their corresponding supplier variant has been removed. A fresh live comparison confirmed
+that behavior, so membership in the storefront `all-variants` response is only identity evidence.
+It is not positive availability evidence.
+
+The server must prove all of this for the selected variant:
 
 - the product and variant are active;
-- the selected SKU resolves to the expected stored catalog/template mapping;
+- the storefront product ID, variant ID, storefront SKU, title, and options resolve as seller-store
+  identity without being treated as supplier identity;
+- when the storefront variant has a `Product` option, its product-line name plus the complete
+  normalized non-Product option map resolves to exactly one variant in the current product-line
+  response; that result owns the supplier product/variant identity and supplier SKU;
+- when the storefront variant has no `Product` option, the supplier-facing SKU used by that path is
+  an exact member of a completed current supplier-catalog generation, not a partial page or stale
+  local snapshot;
+- storefront and supplier SKUs are kept in separate fields/namespaces. They may differ and must not
+  be equated, copied over one another, or used as an implicit fallback;
+- missing, ambiguous, fuzzy/nearest-option, incomplete, or unverified reconciliation fails closed;
 - the quantity is valid;
 - the current server price is available in the checkout currency under the existing multi-currency
   behavior;
-- the current shipping calculation can be reproduced from trusted SKU/catalog data without an
+- the current shipping calculation can be reproduced from trusted supplier-SKU/catalog data without an
   unsafe flat fallback;
 - the checkout snapshot can be reproduced later for receipt and fulfillment reconciliation.
 
-An item that fails any requirement remains browsable if desired, but cannot reach PayPal approval.
+The same current-sellability verdict must fail closed at public variant display, add-to-cart, cart
+hydration/revalidation, quantity increase, checkout entry, direct checkout, and PayPal intent
+creation. Compatibility reads have a 15-second timeout. A timed-out, failed, or incomplete provider
+read is `unverified`, never positive availability evidence. A stale cart row remains visible so the
+customer can remove it (or reduce its quantity), but it cannot be increased, checked out, silently
+substituted, or deferred for post-payment adjustment.
+
+Sellability and canonical-order reads for the base product, `all-variants`, and current price are
+strict `no-store` provider reads; the durable storefront snapshot is display fallback only and must
+never become positive availability evidence. The supplier product ID, supplier variant ID, and SKU
+from the exact product-line proof must all equal the completed catalog row before snapshot creation.
+Strict catalog reads require both the variant and parent product to belong to
+`SyncState.lastCompletedRunId`; catalog write batches and generation finalization are fenced by the
+same database lease transaction so a superseded refresh cannot become checkout proof.
+
+Only confirmed drift or unavailability from complete current evidence creates or updates a
+per-variant catalog-data-health incident. Its evidence includes the storefront product/variant IDs,
+title, storefront SKU, complete selected options and `Product` option when present, attempted current
+supplier mapping/IDs/SKU, failure reason, source/generation timestamps, occurrence count, first/last
+seen, and the safe manual action: update the storefront variant to a current product-line item or
+remove it. Transient provider failures, timeouts, and incomplete or otherwise unverified evidence
+remain aggregate operational health and must not fan out into per-variant incidents or one email per
+customer attempt. Confirmed incidents accumulate in the persistent Storefront Data Health admin
+queue. P0.2 does not add a catalog email/outbox path; outbound escalation belongs to the separately
+scoped notification phase if it is later required.
+
+`/admin/shop/storefront-data-health` shows only compact incident counts so catalog statistics and
+SKU lookup remain immediately reachable. The detailed, mobile-first disclosure queue lives at
+`/admin/shop/storefront-data-health/variant-publication-issues`; each issue stays collapsed until an
+admin opens its IDs, supplier evidence, and manual repair instruction.
 
 ---
 
@@ -132,22 +175,33 @@ An item that fails any requirement remains browsable if desired, but cannot reac
 - Signup and shop-home alpha notices are informational only. Completing ordinary signup is the
   product-level definition of joining the alpha waitlist.
 
-### P0.2 implementation checkpoint
+### P0.2 correction checkpoint — locally complete, deployment pending
 
 - P0.2 extends the existing `PaypalIntent` ledger. It does not create a standalone order database,
   new payment table, or alpha-participation store.
 - The ledger intent route accepts browser product/variant/quantity selections only as lookup
   selectors. Product relationships, SKUs, current prices, currency, and shipping are resolved from
   trusted server/provider data before the PayPal order is created.
-- Product publication/availability evidence is checked from the trusted Merchize storefront
-  response. Explicit inactive, deleted, private, taken-down, hidden, draft, retired, or unapproved
-  state blocks checkout; this is not a new arbitrary SKU allowlist.
+- Product publication and storefront variant identity are checked from trusted Merchize responses,
+  but `all-variants` membership is not current sellability proof. A product-line/options match is
+  provisional until its supplier product ID, supplier variant ID, and SKU also match one row in the
+  latest completed catalog generation; variants without a Product option require exact current-
+  catalog SKU membership. This dual-source proof is enforced at public variant display, add-to-cart,
+  stale-cart revalidation, quantity increase, checkout, direct checkout, and PayPal intent creation.
+  Compatibility reads time out after 15 seconds and fail closed as `unverified`.
+  Explicit inactive/deleted/private/taken-down/hidden/draft/retired/unapproved state remains an
+  immediate block.
 - Public selector work is bounded to 25 selector rows, 128 characters per identifier, 25 units per
   merged line, and 100 total units. Duplicate selectors are merged and rechecked; each unique
   product resolves once with at most four concurrent workers, then catalog SKUs resolve in one
   strict batch.
-- Missing or unproven SKU data, provider-catalog mismatch, unsafe shipping fallback, and invalid
-  shipping quotes stop intent creation.
+- Admin/scheduled published-variant audits may cover more than 100 discovered products, but each
+  underlying scan remains bounded to 100 products and four product workers. The orchestration layer
+  globally trims, dedupes, and sorts IDs, awaits deterministic chunks sequentially, and aggregates
+  every chunk's counts, results, and product errors.
+- Missing, ambiguous, or unverified current supplier mapping, SKU data, provider-catalog mismatch,
+  unsafe shipping fallback, and invalid shipping quotes must stop before cart admission and remain
+  blocked at intent creation. Storefront and supplier SKU namespaces must not be collapsed.
 - New rows persist an immutable, versioned, SHA-256-hashed canonical order snapshot plus matching
   external version/hash metadata. A database constraint requires all three fields to be either
   populated together or null together.
@@ -172,19 +226,33 @@ An item that fails any requirement remains browsable if desired, but cannot reac
   label describing money paid always shows the actual completed PayPal capture, never the expected
   canonical total; any difference is surfaced for review.
 
-Repository verification is complete at this checkpoint: the repository source test suite for this
-isolated P0.2 change (132 tests), TypeScript, ESLint, checked-in Prisma 7.8 generated-client
-field/type wiring, both dev/prod
-Prisma schema validations, migration SQL smoke testing on a disposable PostgreSQL database,
-production webpack build, and diff checks pass. No configured database was mutated.
+The current-sellability implementation is locally complete. An additive local SQLite `db push` was
+completed, followed by a complete current-catalog generation covering 905 products and 19,885
+variants. The pre-final live baseline audit found 141 variants across 13 products: 138 available, 3
+confirmed unavailable, and 0 unverified. The final dual-source catalog cross-check is covered by six
+focused regressions, and the full local suite passed 195/195 tests, along with TypeScript, targeted
+ESLint, the production webpack build, and diff checks. A repeat live audit under the final gate and
+deployed sandbox/E2E evidence remain pending. The repair run did not send a notification email. No
+PayPal ledger migration was deployed.
 
-Deployment remains gated. The production ledger has the new
-`20260806000000_add_canonical_order_snapshot` migration pending. The development ledger also has
-the new migration pending, but its pre-existing history diverges: the database records remote-only
-`20260622190331_add_paypal_ledger_transaction_webhook_bindings`, while this repository contains
-`20260622190000_add_paypal_ledger_transaction_webhook_bindings`. Reconcile that history before any
-development migration deploy. Deployed sandbox/E2E verification is still required before the P0.2
-release gates are checked.
+Deployment remains gated. The apparent development history-name divergence was a lost legitimate
+migration file, not a replacement for the checked-in webhook-binding migration. Development has
+both `20260622190000_add_paypal_ledger_transaction_webhook_bindings` and the later
+`20260622190331_add_paypal_ledger_transaction_webhook_bindings` recorded successfully. The latter
+renames PostgreSQL's truncated `...paypalPaymentMode_isActiv` index to Prisma's expected
+`...paypalPaymentMode_isA_idx`; its exact SQL has been restored to this repository with SHA-256
+`2356add3eeef5a0e2c45d179244f99c262c4658590beb55116243f0c7787df3e`.
+
+Do not edit either applied migration, delete or rename `_prisma_migrations` rows, reset a configured
+ledger, or use `migrate resolve` for this repair. The restored 13-migration chain passes on
+disposable PostgreSQL. Read-only status confirms that development has only
+`20260806000000_add_canonical_order_snapshot` pending, while production stops first at the restored
+index rename. The next move is explicit database approval for `prisma migrate deploy` against
+development. The restored rename is already recorded there, so only the canonical-snapshot
+migration should apply. Production's later reviewed rollout must apply and verify the index rename,
+recheck status, then apply the canonical-snapshot migration. Deployed development sandbox/E2E
+verification must pass before production rollout or any P0.2 release gate is checked. P0.3 then
+begins as a read-only destination-behavior trace.
 
 ### Remaining verified alpha gaps
 
@@ -258,27 +326,28 @@ release gates are checked.
 
 ```mermaid
 flowchart TD
-  A["Ordinary account signup (implicit alpha waitlist)"] --> B["Checkout address and final-order review"]
-  B --> C["Server resolves products, variants, currency, and shipping using current checkout rules"]
-  C --> D["Django order-intent OTP verified"]
-  D --> E["PayPal intent and immutable server order snapshot"]
-  E --> F["PayPal approval, authorization, and capture"]
-  F --> G["Capture evidence reconciled"]
-  G --> H["runPaidFulfillmentProcessing"]
-  H --> I["Receipt upload"]
-  I --> J["Django payment save"]
-  J --> K["Accepted Django fulfillment handoff"]
-  K --> L["Merchize register/import"]
-  L --> M["External-number lookup and canonical detail"]
-  M --> N["Address, product, attention, age, and release gates"]
-  N -->|"retryable"| O["Durable scanner retry"]
-  N -->|"customer action"| P["Pause, customer email, admin alert"]
-  N -->|"admin action"| Q["Pause, admin action"]
-  N -->|"ready"| R["Push to fulfillment"]
-  R --> S["Read-back push verification"]
-  S --> T["Preparing milestone and confirmation projection"]
-  T --> U["State-aware progress, invoice, tracking, and issue polling"]
-  U --> V["Tracking, shipped, and delivered milestones"]
+  A["Ordinary account signup (implicit alpha waitlist)"] --> B["Product selection and exact current-sellability gate"]
+  B --> C["Cart revalidation, checkout address, and final-order review"]
+  C --> D["Server re-resolves supplier variant, currency, and shipping using current checkout rules"]
+  D --> E["Django order-intent OTP verified"]
+  E --> F["PayPal intent and immutable server order snapshot"]
+  F --> G["PayPal approval, authorization, and capture"]
+  G --> H["Capture evidence reconciled"]
+  H --> I["runPaidFulfillmentProcessing"]
+  I --> J["Receipt upload"]
+  J --> K["Django payment save"]
+  K --> L["Accepted Django fulfillment handoff"]
+  L --> M["Merchize register/import"]
+  M --> N["External-number lookup and canonical detail"]
+  N --> O["Address, product, attention, age, and release gates"]
+  O -->|"retryable"| P["Durable scanner retry"]
+  O -->|"customer action"| Q["Pause, customer email, admin alert"]
+  O -->|"admin action"| R["Pause, admin action"]
+  O -->|"ready"| S["Push to fulfillment"]
+  S --> T["Read-back push verification"]
+  T --> U["Preparing milestone and confirmation projection"]
+  U --> V["State-aware progress, invoice, tracking, and issue polling"]
+  V --> W["Tracking, shipped, and delivered milestones"]
 ```
 
 The capture-route `after(...)`, PayPal webhook, scheduled recovery scanner, and admin resume can all
@@ -311,22 +380,46 @@ Do these in order. Do not start P1 Merchize webhooks before the P0 release gates
 
 ### P0.2 Create one canonical server order snapshot
 
-Implementation checkpoint: implemented and locally verified. Database deployment and deployed
-sandbox/E2E release-gate verification remain pending. The following remains the acceptance
-contract.
+Correction checkpoint: the snapshot/payment foundation and current-sellability code are locally
+complete. Local SQLite received the additive compatibility data and a complete 905-product/
+19,885-variant generation was built. A pre-final 13-product live baseline returned 141 total/138
+available/3 unavailable/0 unverified; the completed dual-source gate now has focused regression
+coverage and the 195-test suite plus type/lint/build checks pass. Repeat the live audit under the
+final gate before development PayPal migration deployment and deployed sandbox/E2E verification.
+The following remains the acceptance contract.
 
-1. Resolve every product and variant from trusted server data.
-   Reject explicit inactive/private/deleted/taken-down/unapproved product state and explicit
-   inactive/hidden/deleted/draft/retired variant state.
-2. Resolve current unit price and currency server-side while preserving the existing multi-currency
+1. Resolve every storefront product and variant from trusted server data. Treat `all-variants`
+   membership as identity input only. Reject explicit inactive/private/deleted/taken-down/unapproved
+   product state and explicit inactive/hidden/deleted/draft/retired variant state.
+2. Prove current supplier sellability exactly and without substitution:
+   - with a `Product` option, require exactly one current product-line variant whose line name and
+     complete normalized non-Product option map match, then require that preset's supplier product
+     ID, supplier variant ID, and SKU to match one row in the latest completed catalog generation;
+   - without a `Product` option, require exact current SKU membership from a completed supplier-
+     catalog generation;
+   - keep storefront IDs/SKU and supplier IDs/SKU in separate namespaces;
+   - fail closed on missing, ambiguous, fuzzy, partial, stale, or unavailable evidence.
+3. Bound compatibility reads to 15 seconds and use the same fail-closed verdict at public variant
+   display, add-to-cart, cart hydration/revalidation, quantity increase, checkout entry, direct
+   checkout, and PayPal intent creation. Keep stale rows visible/removable, but never defer an
+   unavailable-variant correction until after authorization or capture.
+4. Create/update a per-variant catalog-data-health incident only for confirmed drift or
+   unavailability, with the storefront identity/options, attempted supplier mapping, evidence
+   source/timestamps, failure reason, occurrence history, and the safe manual action. Provider
+   timeouts, outages, incomplete reads, and other unverified evidence stay aggregate and do not
+   create an incident flood. Accumulate confirmed incidents in the Storefront Data Health admin
+   queue. Keep every open incident reachable through server-side pagination and never present a
+   storage failure as a zero-issue state. Do not create a PayPal notification-outbox row, send
+   catalog email, emit one alert per click, or create a PayPal intent for the failure.
+5. Resolve current unit price and currency server-side while preserving the existing multi-currency
    checkout and PayPal behavior. Do not introduce an alpha-wide USD restriction.
-3. Recalculate shipping from trusted SKU/provider/catalog data using the destination behavior
+6. Recalculate shipping from trusted supplier SKU/provider/catalog data using the destination behavior
    already implemented by checkout. This is order-data verification, not a new destination policy.
-4. Reject missing SKU rows or unsafe shipping fallbacks.
+7. Reject missing supplier SKU rows or unsafe shipping fallbacks.
    Bound selector size, line/total quantity, selection count, and provider-request concurrency.
-5. Persist an immutable snapshot containing:
-   - product and variant identifiers;
-   - SKU;
+8. Persist an immutable snapshot containing:
+   - storefront product/variant identifiers and storefront SKU;
+   - resolved supplier product-line/product/variant identifiers and supplier SKU;
    - title and selected options;
    - quantity;
    - server unit price;
@@ -335,16 +428,16 @@ contract.
    - subtotal, shipping, and total;
    - destination country/region;
    - snapshot version and hash.
-6. Build PayPal purchase units and line items only from this snapshot.
-7. Compare both authorization and capture amount/currency to the snapshot before fulfillment. Keep
+9. Build PayPal purchase units and line items only from this snapshot.
+10. Compare both authorization and capture amount/currency to the snapshot before fulfillment. Keep
    the complete chain enforced in webhook, reconciliation, scanner, runner, and admin mutation
    paths.
-8. Generate the receipt from the same snapshot, not from mutable browser state.
-9. Do not add or remove supported destinations as part of this phase.
-10. Do not calculate, add, collect, or pass tax through PayPal. The canonical monetary snapshot,
+11. Generate the receipt from the same snapshot, not from mutable browser state.
+12. Do not add or remove supported destinations as part of this phase.
+13. Do not calculate, add, collect, or pass tax through PayPal. The canonical monetary snapshot,
     PayPal purchase unit, and receipt use merchandise plus shipping only and contain no tax amount
     or tax line.
-11. In recovery UI, canonical lines/destination describe the expected order, while any value labeled
+14. In recovery UI, canonical lines/destination describe the expected order, while any value labeled
     paid comes from actual completed PayPal capture evidence. A difference triggers review and
     disables fulfillment/retry; never relabel the expected total as paid.
 
@@ -888,6 +981,19 @@ emergency fallback only.
 Required tests:
 
 - canonical price/cart mismatch rejection;
+- stale `all-variants` membership absent from the current product line cannot be added to cart or
+  reach PayPal;
+- exact `Product`-option/current-line mapping, ambiguity rejection, no-Product exact current-catalog
+  SKU membership, and incomplete-catalog fail-closed behavior;
+- storefront and supplier SKUs remain distinct through snapshot, receipt, and fulfillment mapping;
+- confirmed catalog drift creates one per-variant incident with retained actionable evidence;
+- provider timeouts/outages and incomplete or otherwise unverified reads fail closed, remain
+  aggregate, and do not create a per-variant incident or notification flood;
+- confirmed incidents accumulate in the detailed Storefront Data Health queue without creating a
+  PayPal notification-outbox row or catalog email;
+- published audit sets above 100 products are globally deduped/sorted, scanned in sequential chunks
+  of at most 100 without multiplying the four-worker limit, and return aggregate counts, results,
+  and product errors for every chunk;
 - amount/currency capture reconciliation;
 - preservation of the existing supported-currency behavior;
 - no tax amount or tax line in PayPal purchase units;
@@ -912,13 +1018,21 @@ Required tests:
 2. Keep live PayPal credentials and production provider mutations unavailable.
 3. Complete the ordinary signup and OTP flow unchanged; verify the signup and shop-home alpha
    notices without expecting a separate enrollment or acknowledgement row.
-4. Exercise checkout acknowledgement and the existing shipping-validation behavior. Do not expect
+4. With a controlled, confirmed stale-variant fixture, verify add-to-cart is disabled/prevented, an
+   injected stale cart remains visible and removable but cannot be increased or checked out, no
+   PayPal intent is created, and repeated observations update one actionable catalog-data-health
+   incident.
+5. Simulate the 15-second compatibility timeout and transient/incomplete provider evidence. Verify
+   each entry point fails closed as `unverified`, no per-variant incident flood is created, and
+   confirmed incidents accumulate only in the Storefront Data Health queue without PayPal-outbox or
+   catalog-email side effects.
+6. Exercise checkout acknowledgement and the existing shipping-validation behavior. Do not expect
    P0.2 to introduce new destination rules or PayPal tax charging.
-5. Use PayPal sandbox for payment paths.
-6. Verify confirmation access on the same device, a private window, and a second device/email link.
-7. Simulate each blocker and confirm customer/admin copy and outbox rows.
-8. Run cron dry-run, then a controlled dev scan.
-9. Verify admin evidence and audit entries.
+7. Use PayPal sandbox for payment paths.
+8. Verify confirmation access on the same device, a private window, and a second device/email link.
+9. Simulate each blocker and confirm customer/admin copy and outbox rows.
+10. Run cron dry-run, then a controlled dev scan.
+11. Verify admin evidence and audit entries.
 
 ### Stage C: deployed sandbox
 
@@ -990,12 +1104,13 @@ actually completed. P0.2 implementation presence alone does not mark a release g
 - [ ] PayPal purchase units contain no tax amount or tax line, and the order is not represented as
       having collected tax. Local automated/build verification passed; deployed sandbox/E2E
       verification remains pending.
-- [ ] Missing SKU or an unsafe shipping fallback cannot authorize checkout, without redefining
-      destination policy. Local automated/build verification passed; deployed sandbox/E2E
-      verification remains pending.
+- [ ] Missing supplier SKU/current mapping or an unsafe shipping fallback cannot enter checkout or
+      authorize payment, without redefining destination policy. Local correction and verification
+      passed; migration deployment and deployed sandbox/E2E verification remain pending.
 - [ ] Product/variant availability and resolver budgets prevent unavailable inventory or an
-      unbounded public selector request from reaching PayPal/provider work. Local automated/build
-      verification passed; deployed sandbox/E2E verification remains pending.
+      unbounded public selector request from entering the cart or reaching PayPal/provider work.
+      Local correction and verification passed; migration deployment and deployed sandbox/E2E
+      verification remain pending.
 - [ ] Recovery surfaces show actual captured money as paid, keep canonical total as expected order
       value, and disable mutations on a full-chain mismatch. Local automated/build verification
       passed; deployed sandbox/E2E verification remains pending.

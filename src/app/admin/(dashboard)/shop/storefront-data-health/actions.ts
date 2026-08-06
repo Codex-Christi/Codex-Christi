@@ -39,6 +39,7 @@ import {
   getCategoryMetadataFromSnapshot,
   normalizeStorefrontCategorySlug,
 } from '@/lib/merchizeStorefront/snapshot';
+import { runPublishedVariantCompatibilityAudit } from '@/lib/merchizeStorefront/publishedVariantCompatibilityAudit';
 
 type StorefrontDataHealthWarningSeverity = 'info' | 'warning' | 'critical';
 
@@ -585,15 +586,24 @@ export async function refreshPriceShippingCatalogAction() {
     });
 
     const result = await refreshMerchizeCatalog();
+    const variantCompatibilityAudit = result.completedFullTraversal
+      ? await runPublishedVariantCompatibilityAudit()
+      : null;
 
     const syncState = await merchizeCatalogPrisma.syncState.findUnique({
       where: { id: 'merchize_catalog' },
     });
 
+    revalidatePath('/admin/shop/storefront-data-health');
+    revalidatePath('/admin/shop/storefront-data-health/variant-publication-issues');
+    revalidatePath('/shop');
+
     return {
       ok: true as const,
       ingestedVariants: result.ingestedVariants,
       totalProducts: result.totalProducts,
+      completedFullTraversal: result.completedFullTraversal,
+      variantCompatibilityAudit,
       syncState,
     };
   } catch (e: unknown) {
@@ -737,6 +747,9 @@ export async function refreshStorefrontSnapshotsAction() {
         error: message,
       };
     });
+    const variantCompatibilityAudit = await runPublishedVariantCompatibilityAudit([...productIds]);
+    revalidatePath('/admin/shop/storefront-data-health');
+    revalidatePath('/admin/shop/storefront-data-health/variant-publication-issues');
     const revalidatedPaths = revalidateStorefrontSnapshotPaths({
       categoryTotalPages,
       productIds,
@@ -753,6 +766,7 @@ export async function refreshStorefrontSnapshotsAction() {
       failures,
       stats,
       seoManifest,
+      variantCompatibilityAudit,
       revalidatedPaths,
     };
 
@@ -776,6 +790,15 @@ export async function refreshStorefrontSnapshotsAction() {
             : 0,
         warnings: result.seoManifest.warnings.length,
       },
+      variantCompatibilityAudit:
+        result.variantCompatibilityAudit.ok
+          ? {
+              ok: true,
+              unavailableCount: result.variantCompatibilityAudit.unavailableCount,
+              unverifiedCount: result.variantCompatibilityAudit.unverifiedCount,
+              scanErrors: result.variantCompatibilityAudit.scanErrors.length,
+            }
+          : result.variantCompatibilityAudit,
       revalidatedPaths: result.revalidatedPaths.length,
       elapsedMs: Date.now() - refreshStartedAt,
     });
@@ -797,6 +820,10 @@ export async function refreshStorefrontSnapshotsAction() {
       failures: [],
       stats: await getStorefrontSnapshotStats().catch(() => getEmptyStorefrontSnapshotStats()),
       seoManifest: getFailedSeoManifestResult(message),
+      variantCompatibilityAudit: {
+        ok: false as const,
+        error: 'Compatibility audit was not run because storefront snapshot refresh failed.',
+      },
       revalidatedPaths: [],
     };
   }
